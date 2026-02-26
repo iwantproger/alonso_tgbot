@@ -19,6 +19,7 @@ from telegram import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
     Update,
 )
 from telegram.ext import (
@@ -26,6 +27,8 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -44,6 +47,13 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 STORAGE.parent.mkdir(exist_ok=True)
+
+# Постоянная клавиатура под полем ввода
+MAIN_REPLY_KB = ReplyKeyboardMarkup(
+    [["🏠 Меню"]],
+    resize_keyboard=True,
+    is_persistent=True,
+)
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  Хранилище подписчиков (JSON-файл)
@@ -218,12 +228,15 @@ def _events_page_text(events: list[dict], page: int, total_pages: int) -> str:
     return "\n".join(lines)
 
 def _events_keyboard(page: int, total_pages: int, mode: str = "all") -> InlineKeyboardMarkup:
-    row = []
+    nav = []
     if page > 0:
-        row.append(InlineKeyboardButton("◀️ Назад", callback_data=f"ev:{mode}:{page-1}"))
+        nav.append(InlineKeyboardButton("◀️ Назад", callback_data=f"ev:{mode}:{page-1}"))
     if page < total_pages - 1:
-        row.append(InlineKeyboardButton("Вперёд ▶️", callback_data=f"ev:{mode}:{page+1}"))
-    return InlineKeyboardMarkup([row]) if row else None
+        nav.append(InlineKeyboardButton("Вперёд ▶️", callback_data=f"ev:{mode}:{page+1}"))
+    rows = [nav] if nav else []
+    rows.append([InlineKeyboardButton("🔍 Сменить фильтр", callback_data="ev_menu")])
+    rows.append([InlineKeyboardButton("🏠 Главное меню",   callback_data="home")])
+    return InlineKeyboardMarkup(rows)
 
 def _filter_events(mode: str) -> list[dict]:
     all_ev = parse_events()
@@ -252,7 +265,7 @@ async def cmd_start(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("🗓 Весь календарь",      callback_data="ev:all:0"),
         ],
         [
-            InlineKeyboardButton("🏁 Только гонки",       callback_data="ev:races:0"),
+            InlineKeyboardButton("🏁 Только гонки",        callback_data="ev:races:0"),
             InlineKeyboardButton("🔥 Только квалификации", callback_data="ev:quali:0"),
         ],
         [InlineKeyboardButton("❌ Отписаться",             callback_data="unsub")],
@@ -266,7 +279,13 @@ async def cmd_start(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
         + "📍 120 событий сезона 2026\n\n"
         + "Выбери действие:"
     )
-    await upd.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
+    await upd.message.reply_text(
+        text, parse_mode="HTML",
+        reply_markup=MAIN_REPLY_KB   # показывает кнопку «🏠 Меню» под полем ввода
+    )
+    await upd.message.reply_text(
+        "👇 Главное меню:", parse_mode="HTML", reply_markup=kb
+    )
 
 async def cmd_subscribe(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat = upd.effective_chat
@@ -296,17 +315,16 @@ async def cmd_schedule(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_events(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Полный хронологический список."""
-    events = parse_events()
-    total  = math.ceil(len(events) / EVENTS_PAGE)
     kb = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🔜 Предстоящие",          callback_data="ev:upcoming:0"),
-            InlineKeyboardButton("🏁 Гонки",                callback_data="ev:races:0"),
+            InlineKeyboardButton("🔜 Предстоящие",     callback_data="ev:upcoming:0"),
+            InlineKeyboardButton("🏁 Гонки",           callback_data="ev:races:0"),
         ],
         [
-            InlineKeyboardButton("🔥 Квалификации",         callback_data="ev:quali:0"),
-            InlineKeyboardButton("📋 Все 120 событий",      callback_data="ev:all:0"),
+            InlineKeyboardButton("🔥 Квалификации",    callback_data="ev:quali:0"),
+            InlineKeyboardButton("📋 Все 120 событий", callback_data="ev:all:0"),
         ],
+        [InlineKeyboardButton("🏠 Главное меню",       callback_data="home")],
     ])
     await upd.message.reply_text(
         "🗓 <b>Выбери, какой список показать:</b>",
@@ -335,16 +353,57 @@ async def on_callback(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data = q.data
     chat = upd.effective_chat
 
+    # ── Главное меню (inline) ──────────────────────────────────────────────────
+    if data == "home":
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Подписаться на уведомления", callback_data="sub")],
+            [
+                InlineKeyboardButton("📅 Ближайшие события",  callback_data="ev:upcoming:0"),
+                InlineKeyboardButton("🗓 Весь календарь",      callback_data="ev:all:0"),
+            ],
+            [
+                InlineKeyboardButton("🏁 Только гонки",        callback_data="ev:races:0"),
+                InlineKeyboardButton("🔥 Только квалификации", callback_data="ev:quali:0"),
+            ],
+            [InlineKeyboardButton("❌ Отписаться",             callback_data="unsub")],
+        ])
+        await q.edit_message_text(
+            "🏎️ <b>F1 2026 — главное меню</b>\n\nВыбери действие:",
+            parse_mode="HTML", reply_markup=kb
+        )
+        return
+
+    # ── Меню выбора фильтра событий ───────────────────────────────────────────
+    if data == "ev_menu":
+        kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("🔜 Предстоящие",     callback_data="ev:upcoming:0"),
+                InlineKeyboardButton("🏁 Гонки",           callback_data="ev:races:0"),
+            ],
+            [
+                InlineKeyboardButton("🔥 Квалификации",    callback_data="ev:quali:0"),
+                InlineKeyboardButton("📋 Все 120 событий", callback_data="ev:all:0"),
+            ],
+            [InlineKeyboardButton("🏠 Главное меню",       callback_data="home")],
+        ])
+        await q.edit_message_text(
+            "🗓 <b>Выбери, какой список показать:</b>",
+            parse_mode="HTML", reply_markup=kb
+        )
+        return
+
     if data == "sub":
         ok  = subscribe(chat.id, chat.type == "private")
         txt = ("✅ <b>Подписка оформлена!</b>\nПришлю за 30 мин и в момент старта 🏎️"
                if ok else "ℹ️ Ты уже подписан(а)!")
-        await q.edit_message_text(txt + "\n\n/events — посмотреть календарь", parse_mode="HTML")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Главное меню", callback_data="home")]])
+        await q.edit_message_text(txt, parse_mode="HTML", reply_markup=kb)
         return
 
     if data == "unsub":
         unsubscribe(chat.id, chat.type == "private")
-        await q.edit_message_text("❌ Подписка отменена.")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Главное меню", callback_data="home")]])
+        await q.edit_message_text("❌ Подписка отменена.", reply_markup=kb)
         return
 
     if data.startswith("ev:"):
@@ -361,6 +420,26 @@ async def on_callback(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
         return
 
+
+# Обработчик текстовой кнопки «🏠 Меню» под полем ввода
+async def on_menu_button(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Подписаться на уведомления", callback_data="sub")],
+        [
+            InlineKeyboardButton("📅 Ближайшие события",  callback_data="ev:upcoming:0"),
+            InlineKeyboardButton("🗓 Весь календарь",      callback_data="ev:all:0"),
+        ],
+        [
+            InlineKeyboardButton("🏁 Только гонки",        callback_data="ev:races:0"),
+            InlineKeyboardButton("🔥 Только квалификации", callback_data="ev:quali:0"),
+        ],
+        [InlineKeyboardButton("❌ Отписаться",             callback_data="unsub")],
+    ])
+    await upd.message.reply_text(
+        "🏎️ <b>F1 2026 — главное меню</b>\n\nВыбери действие:",
+        parse_mode="HTML", reply_markup=kb
+    )
+
 # ──────────────────────────────────────────────────────────────────────────────
 #  Запуск
 # ──────────────────────────────────────────────────────────────────────────────
@@ -376,6 +455,7 @@ def main():
     app.add_handler(CommandHandler("events",      cmd_events))
     app.add_handler(CommandHandler("status",      cmd_status))
     app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(filters.Text(["🏠 Меню"]), on_menu_button))
 
     _schedule_events()
     scheduler.start()
