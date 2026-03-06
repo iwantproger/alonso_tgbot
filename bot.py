@@ -291,30 +291,57 @@ async def f1_laps(sk): return await oget(f"/laps?session_key={sk}")
 def _msk(dt): return dt.astimezone(MSK)
 def dtstr(dt): m=_msk(dt); return f"{m.day} {MG[m.month]}, {m.strftime('%H:%M')} МСК"
 
-def fmt_card(w):
-    s=_msk(w["start_utc"]); e=_msk(w["end_utc"])
-    dates=(f"{s.day}–{e.day} {MG[s.month]}" if s.month==e.month
-           else f"{s.day} {MG[s.month]} – {e.day} {MG[e.month]}")
-    lines=[
-        f"",
+def fmt_card(w, show_done=True):
+    """
+    Карточка уикенда.
+    show_done=True  — пройденные сессии помечаются ✓ и зачёркиваются.
+    """
+    now  = datetime.now(tz=pytz.utc)
+    s    = _msk(w["start_utc"])
+    e    = _msk(w["end_utc"])
+    dates = (f"{s.day}–{e.day} {MG[s.month]}"
+             if s.month == e.month
+             else f"{s.day} {MG[s.month]} – {e.day} {MG[e.month]}")
+
+    lines = [
         f"{w['flag']}  <b>{w['gp_name'].upper()}</b>",
-        f"📍 {w['country']}, {w['city']}   ·   📅 {dates}",
-        f"<code>{'─'*32}</code>",
+        f"<i>📍 {w['country']}, {w['city']}   ·   {dates}</i>",
+        "",
     ]
+
     for ss in w["sessions"]:
-        dt=_msk(ss["start_utc"])
-        lines.append(f"  {ss['emoji']}  {ss['short']:<16}{dt.strftime('%d.%m  %H:%M')} МСК")
+        dt      = _msk(ss["start_utc"])
+        done    = show_done and ss["start_utc"] < now
+        # Формат: две строки — заголовок, затем дата·время
+        day_str  = f"{dt.day:02d} {MG[dt.month]}"
+        time_str = dt.strftime("%H:%M")
+
+        if done:
+            # Зачёркнутый через unicode + серый индикатор
+            name_s  = "".join(c + "̶" for c in ss["short"])
+            lines.append(f"  ✓  <s>{ss['emoji']} {ss['short']}</s>")
+            lines.append(f"      <s>📅 {day_str}  ·  🕐 {time_str} МСК</s>")
+        else:
+            lines.append(f"  {ss['emoji']}  <b>{ss['short']}</b>")
+            lines.append(f"      📅 {day_str}  ·  🕐 {time_str} МСК")
+        lines.append("")   # пустая строка между сессиями
+
+    # убираем последнюю лишнюю пустую строку
+    if lines and lines[-1] == "":
+        lines.pop()
+
     return "\n".join(lines)
 
 def fmt_month(wks,year,month):
-    mwks=[w for w in wks if _msk(w["start_utc"]).year==year and _msk(w["start_utc"]).month==month]
-    hdr=f"🗓 <b>{MR[month]} {year}</b>  —  {len(mwks)} уикенда"
-    sep="\n\n<b>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</b>\n"
-    cards=sep.join(fmt_card(w) for w in mwks)
-    return (hdr+"\n"+cards)[:4090]
+    now   = datetime.now(tz=pytz.utc)
+    mwks  = [w for w in wks if _msk(w["start_utc"]).year==year and _msk(w["start_utc"]).month==month]
+    hdr   = f"🗓 <b>{MR[month]} {year}</b>  —  {len(mwks)} уикенда\n"
+    sep   = "\n\n━━━━━━━━━━━━━━━━━━━━\n\n"
+    cards = sep.join(fmt_card(w, show_done=True) for w in mwks)
+    return (hdr + cards)[:4090]
 
 async def fmt_cur_weekend(w):
-    lines=["🏁 <b>Текущий / ближайший гоночный уикенд</b>\n",fmt_card(w)]
+    lines=["🏁 <b>Текущий / ближайший гоночный уикенд</b>\n",fmt_card(w, show_done=True)]
     stds=await driver_standings()
     if stds:
         lines.append("\n\n🏆 <b>Чемпионат гонщиков 2026</b>")
@@ -708,22 +735,23 @@ def schedule_all():
 
 # ── KEYBOARDS ─────────────────────────────────────────────────────────────────
 REPLY_KB=ReplyKeyboardMarkup([["🏠 Меню"]],resize_keyboard=True,is_persistent=True)
-def _home(): return [InlineKeyboardButton("🏠 Главное меню",callback_data="home")]
+def _home(): return [InlineKeyboardButton("🏠 Меню",callback_data="home")]
 
 def main_kb(cid,priv):
     rows=[]
     if priv:
         subbed=is_subscribed(cid); enabled=subbed and not is_muted(cid)
-        label=("🔔 Включить уведомления" if not subbed
-               else "✅ Уведомления включены" if enabled else "☑️ Уведомления выключены")
+        if not subbed:   label="🔔  Уведомления — вкл"
+        elif enabled:    label="✅  Уведомления — вкл"
+        else:            label="☑️  Уведомления — выкл"
         rows.append([InlineKeyboardButton(label,callback_data="notif_toggle")])
     rows+=[
-        [InlineKeyboardButton("🏁 Текущий уикенд",callback_data="cal:current"),
-         InlineKeyboardButton("⏭ Следующий уикенд",callback_data="cal:next")],
-        [InlineKeyboardButton("⚡ Ближайшее событие",callback_data="cal:next_sess"),
-         InlineKeyboardButton("🗓 Календарь по месяцам",callback_data="cal:months")],
-        [InlineKeyboardButton("🏆 Чемпионат",callback_data="res:standings"),
-         InlineKeyboardButton("📊 Последние результаты",callback_data="res:menu")],
+        [InlineKeyboardButton("🏁 Уикенд",   callback_data="cal:current"),
+         InlineKeyboardButton("⏭ Следующий", callback_data="cal:next"),
+         InlineKeyboardButton("⚡ Сейчас",   callback_data="cal:next_sess")],
+        [InlineKeyboardButton("🗓 Календарь",  callback_data="cal:months"),
+         InlineKeyboardButton("🏆 Чемпионат",  callback_data="res:standings"),
+         InlineKeyboardButton("📊 Итоги",       callback_data="res:menu")],
         [InlineKeyboardButton("✖️ Закрыть",callback_data="close")],
     ]
     return InlineKeyboardMarkup(rows)
@@ -734,7 +762,8 @@ def months_kb(wks):
         m=_msk(w["start_utc"]); seen[(m.year,m.month)]=MR[m.month]
     rows=[]; row=[]
     for (y,mo),name in seen.items():
-        row.append(InlineKeyboardButton(f"{name[:3]} {y}",callback_data=f"cal:month:{y}-{mo:02d}"))
+        # Полное название месяца без года (сезон один)
+        row.append(InlineKeyboardButton(name, callback_data=f"cal:month:{y}-{mo:02d}"))
         if len(row)==3: rows.append(row); row=[]
     if row: rows.append(row)
     rows.append(_home()); return InlineKeyboardMarkup(rows)
@@ -799,7 +828,7 @@ async def on_cb(upd:Update,ctx:ContextTypes.DEFAULT_TYPE):
     if data=="cal:next":
         w=nxt_weekend(build_weekends())
         if not w: await q.edit_message_text("😔 Нет предстоящих уикендов.",reply_markup=back_kb()); return
-        await q.edit_message_text(fmt_card(w),parse_mode="HTML",reply_markup=back_kb()); return
+        await q.edit_message_text(fmt_card(w, show_done=False),parse_mode="HTML",reply_markup=back_kb()); return
 
     if data=="cal:next_sess":
         s=nxt_session(build_weekends())
