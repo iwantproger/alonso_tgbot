@@ -149,66 +149,149 @@ def _wx(en):
 
 async def get_weather(city, target_dt: datetime = None):
     """
-    Если target_dt передан — ищем ближайший hourly-прогноз к этому времени.
-    Иначе — возвращаем текущую погоду.
+    Получает текущую погоду + прогноз на target_dt (если передан).
+    Пробует до 3 раз с паузой — wttr.in бывает нестабилен.
+    Резервный источник: open-meteo.com (работает всегда, без ключа).
     """
     city_q = _city_en(city)
+
+    # ── Попытка 1-3: wttr.in ─────────────────────────────────────────────────
+    data = None
+    for attempt in range(3):
+        try:
+            url = f"https://wttr.in/{city_q}?format=j1"
+            async with http.get(url, timeout=aiohttp.ClientTimeout(total=12),
+                                headers={"User-Agent": "F1Bot/1.0"}) as r:
+                text = await r.text()
+                # wttr.in иногда отдаёт HTML вместо JSON при перегрузке
+                if text.strip().startswith("{"):
+                    import json as _json
+                    data = _json.loads(text)
+                    break
+                else:
+                    log.warning("wttr.in вернул не-JSON (попытка %d): %s...", attempt+1, text[:80])
+        except Exception as e:
+            log.warning("wttr.in попытка %d для '%s': %s", attempt+1, city_q, e)
+        if attempt < 2:
+            await asyncio.sleep(2)
+
+    if data:
+        try:
+            cur = data["current_condition"][0]
+            cur_rain = max(int(h.get("chanceofrain", 0))
+                           for day in data["weather"][:1]
+                           for h in day["hourly"][:3])
+            cur_w = {
+                "temp":  cur["temp_C"],
+                "feels": cur["FeelsLikeC"],
+                "desc":  _wx(cur["weatherDesc"][0]["value"]),
+                "hum":   cur["humidity"],
+                "wind":  cur["windspeedKmph"],
+                "rain":  cur_rain,
+            }
+
+            fc_w = None
+            if target_dt is not None:
+                now_utc    = datetime.now(tz=pytz.utc)
+                delta_days = (target_dt.astimezone(pytz.utc) - now_utc).total_seconds() / 86400
+                if 0 < delta_days <= 5:
+                    target_date = target_dt.astimezone(pytz.utc).strftime("%Y-%m-%d")
+                    target_hour = target_dt.astimezone(pytz.utc).hour
+                    best_h, best_diff = None, 99
+                    for day in data["weather"]:
+                        if day.get("date", "") != target_date:
+                            continue
+                        for h in day["hourly"]:
+                            diff = abs(int(h["time"]) // 100 - target_hour)
+                            if diff < best_diff:
+                                best_diff, best_h = diff, h
+                    if best_h:
+                        fc_w = {
+                            "temp":  best_h["tempC"],
+                            "feels": best_h["FeelsLikeC"],
+                            "desc":  _wx(best_h["weatherDesc"][0]["value"]),
+                            "hum":   best_h["humidity"],
+                            "wind":  best_h["windspeedKmph"],
+                            "rain":  int(best_h.get("chanceofrain", 0)),
+                        }
+
+            return {"current": cur_w, "forecast": fc_w}
+        except Exception as e:
+            log.warning("Парсинг wttr.in для '%s': %s", city_q, e)
+
+    # ── Резерв: Open-Meteo (геокодинг + погода, без ключа) ───────────────────
+    log.info("Переключаемся на open-meteo для '%s'", city_q)
     try:
-        url = f"https://wttr.in/{city_q}?format=j1"
-        async with http.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
-            data = await r.json(content_type=None)
+        # Шаг 1: получаем координаты через open-meteo geocoding
+        geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={city_q}&count=1&language=en"
+        async with http.get(geo_url, timeout=aiohttp.ClientTimeout(total=8)) as r:
+            geo = await r.json(content_type=None)
+        if not geo.get("results"):
+            raise ValueError(f"Город не найден: {city_q}")
+        loc  = geo["results"][0]
+        lat, lon = loc["latitude"], loc["longitude"]
 
-        cur = data["current_condition"][0]
+        # Шаг 2: текущая погода + почасовой прогноз
+        wx_url = (
+            f"https://api.open-meteo.com/v1/forecast"
+            f"?latitude={lat}&longitude={lon}"
+            f"&current=temperature_2m,apparent_temperature,weathercode,windspeed_10m,relativehumidity_2m"
+            f"&hourly=temperature_2m,apparent_temperature,weathercode,windspeed_10m,relativehumidity_2m,precipitation_probability"
+            f"&forecast_days=5&timezone=UTC"
+        )
+        async with http.get(wx_url, timeout=aiohttp.ClientTimeout(total=8)) as r:
+            wx = await r.json(content_type=None)
 
-        # ── Текущая погода ────────────────────────────────────────────────
-        cur_rain = max(int(h.get("chanceofrain", 0))
-                       for day in data["weather"][:1]
-                       for h in day["hourly"][:3])
+        def _wmo(code):
+            # WMO weather code → описание
+            WMO = {0:"☀️ Ясно",1:"🌤 Преимущественно ясно",2:"⛅ Переменная облачность",
+                   3:"☁️ Пасмурно",45:"🌫 Туман",48:"🌫 Иней",51:"🌦 Лёгкая морось",
+                   53:"🌦 Морось",55:"🌧 Сильная морось",61:"🌦 Лёгкий дождь",
+                   63:"🌧 Дождь",65:"🌧 Сильный дождь",71:"🌨 Лёгкий снег",
+                   73:"🌨 Снег",75:"❄️ Сильный снег",80:"🌦 Ливень",
+                   81:"🌧 Сильный ливень",95:"⛈ Гроза",96:"⛈ Гроза с градом"}
+            return WMO.get(int(code), f"Код {code}")
+
+        cur_c = wx["current"]
         cur_w = {
-            "temp":  cur["temp_C"],
-            "feels": cur["FeelsLikeC"],
-            "desc":  _wx(cur["weatherDesc"][0]["value"]),
-            "hum":   cur["humidity"],
-            "wind":  cur["windspeedKmph"],
-            "rain":  cur_rain,
+            "temp":  str(round(cur_c["temperature_2m"])),
+            "feels": str(round(cur_c["apparent_temperature"])),
+            "desc":  _wmo(cur_c["weathercode"]),
+            "hum":   str(round(cur_c["relativehumidity_2m"])),
+            "wind":  str(round(cur_c["windspeed_10m"])),
+            "rain":  0,
         }
 
-        # ── Прогноз на время сессии ───────────────────────────────────────
         fc_w = None
         if target_dt is not None:
-            now_utc = datetime.now(tz=pytz.utc)
+            now_utc    = datetime.now(tz=pytz.utc)
             delta_days = (target_dt.astimezone(pytz.utc) - now_utc).total_seconds() / 86400
-            if delta_days <= 5:   # wttr.in даёт прогноз до 5 дней
-                target_local = target_dt.astimezone(pytz.utc)
-                target_date  = target_local.strftime("%Y-%m-%d")
-                target_hour  = target_local.hour
+            if 0 < delta_days <= 5:
+                target_iso = target_dt.astimezone(pytz.utc).strftime("%Y-%m-%dT%H:00")
+                times = wx["hourly"]["time"]
+                if target_iso in times:
+                    idx = times.index(target_iso)
+                else:
+                    # ближайший час
+                    from datetime import datetime as _dt
+                    target_ts = target_dt.astimezone(pytz.utc).replace(minute=0, second=0, microsecond=0)
+                    idx = min(range(len(times)),
+                              key=lambda i: abs((_dt.fromisoformat(times[i]).replace(tzinfo=pytz.utc) - target_ts).total_seconds()))
+                h = wx["hourly"]
+                fc_w = {
+                    "temp":  str(round(h["temperature_2m"][idx])),
+                    "feels": str(round(h["apparent_temperature"][idx])),
+                    "desc":  _wmo(h["weathercode"][idx]),
+                    "hum":   str(round(h["relativehumidity_2m"][idx])),
+                    "wind":  str(round(h["windspeed_10m"][idx])),
+                    "rain":  int(h["precipitation_probability"][idx] or 0),
+                }
 
-                best_h = None
-                best_diff = 99
-                for day in data["weather"]:
-                    if day.get("date", "") != target_date:
-                        continue
-                    for h in day["hourly"]:
-                        h_time = int(h["time"]) // 100   # "900" → 9
-                        diff = abs(h_time - target_hour)
-                        if diff < best_diff:
-                            best_diff = diff
-                            best_h = h
-
-                if best_h:
-                    fc_w = {
-                        "temp":  best_h["tempC"],
-                        "feels": best_h["FeelsLikeC"],
-                        "desc":  _wx(best_h["weatherDesc"][0]["value"]),
-                        "hum":   best_h["humidity"],
-                        "wind":  best_h["windspeedKmph"],
-                        "rain":  int(best_h.get("chanceofrain", 0)),
-                    }
-
+        log.info("open-meteo успешно для '%s'", city_q)
         return {"current": cur_w, "forecast": fc_w}
 
     except Exception as e:
-        log.warning("Погода '%s'→'%s': %s", city, city_q, e)
+        log.error("open-meteo для '%s': %s", city_q, e)
         return {"current": {}, "forecast": None}
 
 
