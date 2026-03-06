@@ -147,24 +147,101 @@ def _wx(en):
         if k.lower() in en.lower(): return v
     return en
 
-async def get_weather(city):
-    city_q=_city_en(city)
+async def get_weather(city, target_dt: datetime = None):
+    """
+    Если target_dt передан — ищем ближайший hourly-прогноз к этому времени.
+    Иначе — возвращаем текущую погоду.
+    """
+    city_q = _city_en(city)
     try:
-        url=f"https://wttr.in/{city_q}?format=j1"
-        async with http.get(url,timeout=aiohttp.ClientTimeout(total=8)) as r:
-            data=await r.json(content_type=None)
-        cur=data["current_condition"][0]
-        hourly=data["weather"][0]["hourly"]
-        rain=max(int(h.get("chanceofrain",0)) for h in hourly[:4])
-        desc=_wx(cur["weatherDesc"][0]["value"])
-        return {"temp":cur["temp_C"],"feels":cur["FeelsLikeC"],"desc":desc,
-                "hum":cur["humidity"],"wind":cur["windspeedKmph"],"rain":rain}
-    except Exception as e:
-        log.warning("Погода '%s'→'%s': %s",city,city_q,e); return {}
+        url = f"https://wttr.in/{city_q}?format=j1"
+        async with http.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
+            data = await r.json(content_type=None)
 
+        cur = data["current_condition"][0]
+
+        # ── Текущая погода ────────────────────────────────────────────────
+        cur_rain = max(int(h.get("chanceofrain", 0))
+                       for day in data["weather"][:1]
+                       for h in day["hourly"][:3])
+        cur_w = {
+            "temp":  cur["temp_C"],
+            "feels": cur["FeelsLikeC"],
+            "desc":  _wx(cur["weatherDesc"][0]["value"]),
+            "hum":   cur["humidity"],
+            "wind":  cur["windspeedKmph"],
+            "rain":  cur_rain,
+        }
+
+        # ── Прогноз на время сессии ───────────────────────────────────────
+        fc_w = None
+        if target_dt is not None:
+            now_utc = datetime.now(tz=pytz.utc)
+            delta_days = (target_dt.astimezone(pytz.utc) - now_utc).total_seconds() / 86400
+            if delta_days <= 5:   # wttr.in даёт прогноз до 5 дней
+                target_local = target_dt.astimezone(pytz.utc)
+                target_date  = target_local.strftime("%Y-%m-%d")
+                target_hour  = target_local.hour
+
+                best_h = None
+                best_diff = 99
+                for day in data["weather"]:
+                    if day.get("date", "") != target_date:
+                        continue
+                    for h in day["hourly"]:
+                        h_time = int(h["time"]) // 100   # "900" → 9
+                        diff = abs(h_time - target_hour)
+                        if diff < best_diff:
+                            best_diff = diff
+                            best_h = h
+
+                if best_h:
+                    fc_w = {
+                        "temp":  best_h["tempC"],
+                        "feels": best_h["FeelsLikeC"],
+                        "desc":  _wx(best_h["weatherDesc"][0]["value"]),
+                        "hum":   best_h["humidity"],
+                        "wind":  best_h["windspeedKmph"],
+                        "rain":  int(best_h.get("chanceofrain", 0)),
+                    }
+
+        return {"current": cur_w, "forecast": fc_w}
+
+    except Exception as e:
+        log.warning("Погода '%s'→'%s': %s", city, city_q, e)
+        return {"current": {}, "forecast": None}
+
+
+def fmt_weather_block(wdata: dict, target_dt: datetime = None) -> str:
+    """Форматирует один или два блока погоды (сейчас + прогноз)."""
+    cur  = wdata.get("current", {})
+    fc   = wdata.get("forecast")
+    lines = []
+
+    def _fmt(w, label):
+        if not w:
+            return f"{label}: недоступно"
+        rain = f"\u2614 {w['rain']}%" if int(w["rain"]) > 5 else "\u2600\ufe0f без осадков"
+        return (label + "\n"
+                + f"\U0001f321 <b>{w['temp']}\u00b0C</b> (ощущается {w['feels']}\u00b0C) \u00b7 {w['desc']}\n"
+                + f"\U0001f4a7 {w['hum']}% \u00b7 \U0001f4a8 {w['wind']} км/ч \u00b7 {rain}")
+
+    lines.append(_fmt(cur, "🌍 <b>Сейчас:</b>"))
+
+    if fc and target_dt:
+        msk_t = target_dt.astimezone(MSK).strftime("%H:%M МСК")
+        lines.append("")
+        lines.append(_fmt(fc, f"🔮 <b>Прогноз на {msk_t}:</b>"))
+
+    return "\n".join(lines)
+
+
+# Обратная совместимость — старый fmt_weather для live-монитора
 def fmt_weather(w):
+    if isinstance(w, dict) and "current" in w:
+        w = w.get("current", {})
     if not w: return "🌡 Погода временно недоступна"
-    rain=f"☔ {w['rain']}%" if int(w["rain"])>5 else "☀️ Без осадков"
+    rain = f"☔ {w['rain']}%" if int(w["rain"]) > 5 else "☀️ Без осадков"
     return f"🌡 <b>{w['temp']}°C</b> (ощущается {w['feels']}°C) · {w['desc']}\n💧 {w['hum']}% · 💨 {w['wind']} км/ч · {rain}"
 
 # ── JOLPICA API ───────────────────────────────────────────────────────────────
@@ -269,7 +346,8 @@ async def fmt_next_sess(sess):
            f"📍 {sess['country']}, {city}",
            f"🕐 <b>{msk_dt.strftime('%H:%M')} МСК</b>  ·  {loc.strftime('%H:%M')} местного",
            f"📅 {msk_dt.day} {MG[msk_dt.month]}",""]
-    w=await get_weather(city); lines.append(fmt_weather(w))
+    wdata=await get_weather(city, target_dt=sess["start_utc"])
+    lines.append(fmt_weather_block(wdata, target_dt=sess["start_utc"]))
     if "гонка" in sess["summary"].lower():
         _,qr=await last_quali()
         if qr:
@@ -585,7 +663,8 @@ async def send_reminder(ev,mins):
     lines=[head,"",f"{ev.get('flag','🏁')} <b>{ev['summary']}</b>",
            f"📍 {ev.get('country','')}, {city}",
            f"🕐 <b>{msk_dt.strftime('%H:%M')} МСК</b>  ·  {loc.strftime('%H:%M')} местного",""]
-    w=await get_weather(city); lines.append(fmt_weather(w))
+    wdata=await get_weather(city, target_dt=ev["start_utc"])
+    lines.append(fmt_weather_block(wdata, target_dt=ev["start_utc"]))
     if "гонка" in ev["summary"].lower() and mins>0:
         _,qr=await last_quali()
         if qr:
@@ -645,6 +724,7 @@ def main_kb(cid,priv):
          InlineKeyboardButton("🗓 Календарь по месяцам",callback_data="cal:months")],
         [InlineKeyboardButton("🏆 Чемпионат",callback_data="res:standings"),
          InlineKeyboardButton("📊 Последние результаты",callback_data="res:menu")],
+        [InlineKeyboardButton("✖️ Закрыть",callback_data="close")],
     ]
     return InlineKeyboardMarkup(rows)
 
@@ -696,6 +776,11 @@ async def cmd_status(upd:Update,ctx:ContextTypes.DEFAULT_TYPE):
 async def on_cb(upd:Update,ctx:ContextTypes.DEFAULT_TYPE):
     q:CallbackQuery=upd.callback_query; await q.answer()
     data=q.data; chat=upd.effective_chat; priv=chat.type=="private"
+
+    if data=="close":
+        try: await q.message.delete()
+        except: await q.edit_message_reply_markup(reply_markup=None)
+        return
 
     if data=="home":
         await q.edit_message_text("🏎️ <b>F1 2026 — главное меню</b>",parse_mode="HTML",reply_markup=main_kb(chat.id,priv)); return
