@@ -741,18 +741,18 @@ def main_kb(cid,priv):
     rows=[]
     if priv:
         subbed=is_subscribed(cid); enabled=subbed and not is_muted(cid)
-        if not subbed:   label="🔔  Уведомления — вкл"
-        elif enabled:    label="✅  Уведомления — вкл"
-        else:            label="☑️  Уведомления — выкл"
-        rows.append([InlineKeyboardButton(label,callback_data="notif_toggle")])
+        if not subbed:   label="🔔 Уведомления — выкл"
+        elif enabled:    label="✅ Уведомления — вкл"
+        else:            label="☑️ Уведомления — выкл"
+        rows.append([InlineKeyboardButton(label, callback_data="notif_toggle")])
     rows+=[
-        [InlineKeyboardButton("🏁 Уикенд",   callback_data="cal:current"),
-         InlineKeyboardButton("⏭ Следующий", callback_data="cal:next"),
-         InlineKeyboardButton("⚡ Сейчас",   callback_data="cal:next_sess")],
-        [InlineKeyboardButton("🗓 Календарь",  callback_data="cal:months"),
-         InlineKeyboardButton("🏆 Чемпионат",  callback_data="res:standings"),
-         InlineKeyboardButton("📊 Итоги",       callback_data="res:menu")],
-        [InlineKeyboardButton("✖️ Закрыть",callback_data="close")],
+        [InlineKeyboardButton("⚡ Что будет дальше", callback_data="cal:next_sess")],
+        [InlineKeyboardButton("🏁 Этот уикенд",  callback_data="cal:current"),
+         InlineKeyboardButton("⏭ Будущий",       callback_data="cal:next")],
+        [InlineKeyboardButton("🗓 Календарь всех событий", callback_data="cal:months")],
+        [InlineKeyboardButton("🏆 Баллы за сезон", callback_data="res:standings"),
+         InlineKeyboardButton("📊 Результаты",     callback_data="res:menu")],
+        [InlineKeyboardButton("✖️ Закрыть",        callback_data="close")],
     ]
     return InlineKeyboardMarkup(rows)
 
