@@ -305,7 +305,8 @@ def fmt_weather_block(wdata: dict, target_dt: datetime = None) -> str:
             return f"{label}: данные недоступны"
         rain = f"☔ {w['rain']}%" if int(w["rain"]) > 5 else "☀️ без осадков"
         return (label + "\n"
-                + f"🌡 <b>{w['temp']}°C</b> (ощущается {w['feels']}°C) · {w['desc']}\n"
+                + f"{w['desc']}\n"
+                + f"🌡 <b>{w['temp']}°C</b> (ощущается {w['feels']}°C)\n"
                 + f"💧 {w['hum']}% · 💨 {w['wind']} км/ч · {rain}")
 
     # Если есть прогноз на время сессии — показываем только его
@@ -1077,14 +1078,17 @@ async def cmd_start(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def on_menu(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat = upd.effective_chat; priv = chat.type == "private"
-    # Удаляем сообщение пользователя «🏠 Меню»
+    # Удаляем сообщение пользователя «🏠 Меню» (тихо — в группах может не быть прав)
     try:
         await upd.message.delete()
     except Exception:
         pass
-    await upd.message.reply_text(
-        "🏎️ <b>F1 2026 — главное меню</b>",
-        parse_mode="HTML", reply_markup=main_kb(chat.id, priv)
+    # Отправляем через chat, а не через message (message уже удалён)
+    await ctx.bot.send_message(
+        chat_id=chat.id,
+        text="🏎️ <b>F1 2026 — главное меню</b>",
+        parse_mode="HTML",
+        reply_markup=main_kb(chat.id, priv)
     )
 
 async def cmd_status(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
