@@ -355,6 +355,20 @@ async def last_race():
     if not races: return "",[]
     return races[0].get("raceName",""),races[0].get("Results",[])
 
+async def race_by_round(season: int, rnd: int):
+    d=await jget(f"/{season}/{rnd}/results.json")
+    if not d: return "",[]
+    races=d["MRData"]["RaceTable"]["Races"]
+    if not races: return "",[]
+    return races[0].get("raceName",""),races[0].get("Results",[])
+
+async def quali_by_round(season: int, rnd: int):
+    d=await jget(f"/{season}/{rnd}/qualifying.json")
+    if not d: return "",[]
+    races=d["MRData"]["RaceTable"]["Races"]
+    if not races: return "",[]
+    return races[0].get("raceName",""),races[0].get("QualifyingResults",[])
+
 # ── OPENF1 API ────────────────────────────────────────────────────────────────
 O="https://api.openf1.org/v1"
 async def oget(path):
@@ -369,6 +383,20 @@ async def f1_drivers(sk): d=await oget(f"/drivers?session_key={sk}"); return {x[
 async def f1_rc(sk): return await oget(f"/race_control?session_key={sk}")
 async def f1_pit(sk): return await oget(f"/pit?session_key={sk}")
 async def f1_laps(sk): return await oget(f"/laps?session_key={sk}")
+
+# ── DRIVER EMOJIS ────────────────────────────────────────────────────────────
+_DRIVER_EMOJI = {
+    "Verstappen":"🦁","Hamilton":"⭐","Leclerc":"🔴","Norris":"🍊",
+    "Piastri":"🥝","Russell":"💙","Sainz":"🐂","Alonso":"🔱",
+    "Perez":"🌮","Stroll":"🍁","Gasly":"🐓","Ocon":"🐓",
+    "Bottas":"🇫🇮","Zhou":"🐉","Albon":"🇹🇭","Sargeant":"🦅",
+    "Hulkenberg":"🦔","Magnussen":"🇩🇰","Tsunoda":"🎌","De Vries":"🌷",
+    "Lawson":"🥝","Bearman":"🇬🇧","Colapinto":"🇦🇷","Doohan":"🦘",
+    "Antonelli":"🇮🇹","Hadjar":"🇫🇷","Bortoleto":"🇧🇷","Iwasa":"🎌",
+}
+def driver_emoji(last_name: str) -> str:
+    return _DRIVER_EMOJI.get(last_name, "🏎️")
+
 
 # ── FORMATTERS ────────────────────────────────────────────────────────────────
 def _msk(dt): return dt.astimezone(MSK)
@@ -449,22 +477,44 @@ def local_tz(city):
     return MSK
 
 async def fmt_next_sess(sess):
-    city=sess["city"]; msk_dt=_msk(sess["start_utc"])
-    loc=sess["start_utc"].astimezone(local_tz(city))
-    lines=[f"{sess['flag']} <b>Следующее событие</b>\n",
-           f"{sess['emoji']} <b>{sess['summary']}</b>",
-           f"📍 {sess['country']}, {city}",
-           f"🕐 <b>{msk_dt.strftime('%H:%M')} МСК</b>  ·  {loc.strftime('%H:%M')} местного",
-           f"📅 {msk_dt.day} {MG[msk_dt.month]}",""]
-    wdata=await get_weather(city, target_dt=sess["start_utc"])
+    city    = sess["city"]
+    msk_dt  = _msk(sess["start_utc"])
+    loc     = sess["start_utc"].astimezone(local_tz(city))
+    is_race = "гонка" in sess["summary"].lower()
+
+    lines = [
+        f"{sess['flag']} <b>Ближайшее событие</b>",
+        "",
+        f"{sess['emoji']} <b>{sess['summary']}</b>",
+        f"📍 {sess['country']}, {city}",
+        f"🕐 <b>{msk_dt.strftime('%H:%M')} МСК</b>  ·  {loc.strftime('%H:%M')} местного",
+        f"📅 {msk_dt.day} {MG[msk_dt.month]}",
+        "",
+    ]
+    wdata = await get_weather(city, target_dt=sess["start_utc"])
     lines.append(fmt_weather_block(wdata, target_dt=sess["start_utc"]))
-    if "гонка" in sess["summary"].lower():
-        _,qr=await last_quali()
+
+    if is_race:
+        _, qr = await last_quali()
         if qr:
-            lines.append("\n🏁 <b>Стартовая решётка (топ-10):</b>")
-            for q in qr[:10]:
-                d=q["Driver"]; best=q.get("Q3") or q.get("Q2") or q.get("Q1") or "—"
-                lines.append(f"  {q['position']}. <b>{d['givenName'][0]}. {d['familyName']}</b> ({q['Constructor']['name']})  {best}")
+            lines.append("\n🏁 <b>Стартовая решётка:</b>")
+            team_emojis = {
+                "Ferrari":"🔴","Red Bull":"🐂","McLaren":"🍊","Mercedes":"⭐",
+                "Aston Martin":"🟢","Alpine":"🔵","Williams":"💙","Haas":"⬜",
+                "Kick Sauber":"🟩","RB":"🔵",
+            }
+            for q in qr:   # все гонщики, не только топ-10
+                d       = q["Driver"]
+                last    = d["familyName"]
+                demoji  = driver_emoji(last)
+                team    = q["Constructor"]["name"]
+                temoji  = next((v for k,v in team_emojis.items() if k in team), "🏎️")
+                best    = q.get("Q3") or q.get("Q2") or q.get("Q1") or "—"
+                lines.append(
+                    f"  <b>P{q['position']}</b>  {demoji} {d['givenName'][0]}. {last}"
+                    f"  {temoji} {team}  <code>{best}</code>"
+                )
+
     return "\n".join(lines)
 
 async def fmt_standings():
@@ -530,6 +580,100 @@ async def fmt_race():
             if st and st!="Finished": lines.append(f"  ⚠️ Статус: {st}")
             if r.get("FastestLap"):
                 fl=r["FastestLap"]; lines.append(f"  ⚡ Быстрый круг: {fl['Time']['time']} (круг {fl['lap']})")
+    return "\n".join(lines)
+
+async def fmt_cur_weekend_with_results(w: dict) -> tuple:
+    """Карточка текущего уикенда + клавиатура с результатами."""
+    lines = ["🏁 <b>Текущий / ближайший гоночный уикенд</b>\n", fmt_card(w, show_done=True)]
+    stds  = await driver_standings()
+    if stds:
+        lines.append("\n\n🏆 <b>Чемпионат гонщиков 2026</b>")
+        for s in stds[:10]:
+            d    = s["Driver"]
+            name = f"{d['givenName'][0]}. {d['familyName']}"
+            team = (s.get("Constructors") or [{}])[0].get("name", "—")
+            lines.append(f"  {s['position']}. <b>{name}</b> ({team}) · {s['points']} очк.")
+    return "\n".join(lines)
+
+async def fmt_past_weekend(w: dict, rnd: int) -> str:
+    """Результаты прошедшего уикенда: гонка + чемпионат."""
+    rname, results = await race_by_round(2026, rnd)
+    stds           = await driver_standings()
+    pts_map        = {s["Driver"]["driverId"]: s["points"] for s in stds}
+
+    lines = [
+        f"{w['flag']} <b>{w['gp_name'].upper()}</b>",
+        f"<i>📍 {w['country']}, {w['city']}</i>",
+        "",
+    ]
+
+    if results:
+        medals = ["🥇","🥈","🥉"]
+        lines.append("<b>Подиум:</b>")
+        for r in results[:3]:
+            d    = r["Driver"]
+            name = f"{d['givenName']} {d['familyName']}"
+            demoji = driver_emoji(d["familyName"])
+            lines.append(
+                f"  {medals[int(r['position'])-1]} {demoji} <b>{name}</b>"
+                f" ({r['Constructor']['name']}) +{r.get('points','0')} очк."
+            )
+        lines.append("")
+        lines.append("<b>Топ-10:</b>")
+        for r in results[:10]:
+            d     = r["Driver"]
+            total = pts_map.get(d["driverId"], "—")
+            demoji = driver_emoji(d["familyName"])
+            lines.append(
+                f"  {r['position']}. {demoji} {d['givenName'][0]}. {d['familyName']}"
+                f" ({r['Constructor']['name']}) +{r.get('points','0')} → {total} очк."
+            )
+    else:
+        lines.append("📭 Результаты гонки ещё не опубликованы")
+
+    if stds:
+        lines.append("\n🏆 <b>Чемпионат после этапа:</b>")
+        for s in stds[:5]:
+            d    = s["Driver"]
+            name = f"{d['givenName'][0]}. {d['familyName']}"
+            demoji = driver_emoji(d["familyName"])
+            lines.append(f"  {s['position']}. {demoji} <b>{name}</b> — {s['points']} очк.")
+
+    return "\n".join(lines)
+
+async def fmt_past_quali(w: dict, rnd: int) -> str:
+    """Результаты квалификации прошедшего уикенда."""
+    rname, results = await quali_by_round(2026, rnd)
+    if not results:
+        return "📭 Результаты квалификации ещё не опубликованы"
+
+    lines = [
+        f"{w['flag']} <b>{w['gp_name']} — Квалификация</b>",
+        "",
+    ]
+    q3 = [r for r in results if r.get("Q3")]
+    q2 = [r for r in results if r.get("Q2") and not r.get("Q3")]
+    q1 = [r for r in results if not r.get("Q2")]
+
+    if q3:
+        lines.append("✅ <b>Q3:</b>")
+        for r in q3:
+            d = r["Driver"]
+            demoji = driver_emoji(d["familyName"])
+            lines.append(f"  {r['position']}. {demoji} <b>{d['givenName'][0]}. {d['familyName']}</b>"
+                         f" ({r['Constructor']['name']})  <code>{r['Q3']}</code>")
+    if q2:
+        lines.append("\n⚠️ <b>Выбыли в Q2:</b>")
+        for r in q2:
+            d = r["Driver"]
+            demoji = driver_emoji(d["familyName"])
+            lines.append(f"  {r['position']}. {demoji} {d['givenName'][0]}. {d['familyName']}  <code>{r['Q2']}</code>")
+    if q1:
+        lines.append("\n❌ <b>Выбыли в Q1:</b>")
+        for r in q1:
+            d = r["Driver"]
+            demoji = driver_emoji(d["familyName"])
+            lines.append(f"  {r['position']}. {demoji} {d['givenName'][0]}. {d['familyName']}  <code>{r.get('Q1','—')}</code>")
     return "\n".join(lines)
 
 # ── LIVE MONITOR ──────────────────────────────────────────────────────────────
@@ -820,128 +964,264 @@ def schedule_all():
 REPLY_KB=ReplyKeyboardMarkup([["🏠 Меню"]],resize_keyboard=True,is_persistent=True)
 def _home(): return [InlineKeyboardButton("🏠 Меню",callback_data="home")]
 
-def main_kb(cid,priv):
-    rows=[]
+def main_kb(cid, priv):
+    rows = []
     if priv:
-        subbed=is_subscribed(cid); enabled=subbed and not is_muted(cid)
-        if not subbed:   label="🔔 Уведомления — выкл"
-        elif enabled:    label="✅ Уведомления — вкл"
-        else:            label="☑️ Уведомления — выкл"
+        subbed  = is_subscribed(cid)
+        enabled = subbed and not is_muted(cid)
+        if not subbed:   label = "🔔 Уведомления — выкл"
+        elif enabled:    label = "✅ Уведомления — вкл"
+        else:            label = "☑️ Уведомления — выкл"
         rows.append([InlineKeyboardButton(label, callback_data="notif_toggle")])
-    rows+=[
-        [InlineKeyboardButton("⚡ Что будет дальше", callback_data="cal:next_sess")],
-        [InlineKeyboardButton("🏁 Этот уикенд",  callback_data="cal:current"),
-         InlineKeyboardButton("⏭ Будущий",       callback_data="cal:next")],
-        [InlineKeyboardButton("🗓 Календарь всех событий", callback_data="cal:months")],
-        [InlineKeyboardButton("🏆 Баллы за сезон", callback_data="res:standings"),
-         InlineKeyboardButton("📊 Результаты",     callback_data="res:menu")],
-        [InlineKeyboardButton("✖️ Закрыть",        callback_data="close")],
+    rows += [
+        [InlineKeyboardButton("⚡ Ближайшее событие",       callback_data="cal:next_sess")],
+        [InlineKeyboardButton("🏁 Этот уикенд",             callback_data="cal:current")],
+        [InlineKeyboardButton("⏭ Следующий уикенд",         callback_data="cal:next")],
+        [InlineKeyboardButton("🗓 Календарь всех событий",  callback_data="cal:months")],
+        [InlineKeyboardButton("🕰 Прошедшие уикенды",       callback_data="cal:past")],
+        [InlineKeyboardButton("🏆 Баллы за сезон",          callback_data="res:standings")],
+        [InlineKeyboardButton("✖️ Закрыть",                  callback_data="close")],
     ]
     return InlineKeyboardMarkup(rows)
 
+def cur_weekend_kb():
+    """Кнопки внутри текущего уикенда."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔥 Квалификация",  callback_data="res:quali"),
+         InlineKeyboardButton("🏁 Гонка",          callback_data="res:race")],
+        _home(),
+    ])
+
 def months_kb(wks):
-    seen=OrderedDict()
+    seen = OrderedDict()
     for w in wks:
-        m=_msk(w["start_utc"]); seen[(m.year,m.month)]=MR[m.month]
-    rows=[]; row=[]
-    for (y,mo),name in seen.items():
-        # Полное название месяца без года (сезон один)
+        m = _msk(w["start_utc"]); seen[(m.year, m.month)] = MR[m.month]
+    rows = []; row = []
+    for (y, mo), name in seen.items():
         row.append(InlineKeyboardButton(name, callback_data=f"cal:month:{y}-{mo:02d}"))
-        if len(row)==3: rows.append(row); row=[]
+        if len(row) == 3: rows.append(row); row = []
     if row: rows.append(row)
     rows.append(_home()); return InlineKeyboardMarkup(rows)
 
-def month_nav_kb(wks,year,month):
-    all_m=sorted({(_msk(w["start_utc"]).year,_msk(w["start_utc"]).month) for w in wks})
-    idx=all_m.index((year,month)) if (year,month) in all_m else 0
-    nav=[]
-    if idx>0: py,pm=all_m[idx-1]; nav.append(InlineKeyboardButton(f"◀️ {MR[pm][:3]}",callback_data=f"cal:month:{py}-{pm:02d}"))
-    if idx<len(all_m)-1: ny,nm=all_m[idx+1]; nav.append(InlineKeyboardButton(f"{MR[nm][:3]} ▶️",callback_data=f"cal:month:{ny}-{nm:02d}"))
-    rows=[nav] if nav else []
-    rows.append([InlineKeyboardButton("📅 Все месяцы",callback_data="cal:months")])
+def month_nav_kb(wks, year, month):
+    all_m = sorted({(_msk(w["start_utc"]).year, _msk(w["start_utc"]).month) for w in wks})
+    idx   = all_m.index((year, month)) if (year, month) in all_m else 0
+    nav   = []
+    if idx > 0:
+        py,pm = all_m[idx-1]; nav.append(InlineKeyboardButton(f"◀️ {MR[pm][:3]}", callback_data=f"cal:month:{py}-{pm:02d}"))
+    if idx < len(all_m)-1:
+        ny,nm = all_m[idx+1]; nav.append(InlineKeyboardButton(f"{MR[nm][:3]} ▶️", callback_data=f"cal:month:{ny}-{nm:02d}"))
+    rows = [nav] if nav else []
+    rows.append([InlineKeyboardButton("📅 Все месяцы", callback_data="cal:months")])
     rows.append(_home()); return InlineKeyboardMarkup(rows)
 
+def past_weekends_kb(wks):
+    """Кнопки прошедших уикендов."""
+    now  = datetime.now(tz=pytz.utc)
+    past = [w for w in wks if w["end_utc"] < now]
+    rows = []
+    for i, w in enumerate(reversed(past)):  # свежие сверху
+        s = _msk(w["start_utc"]); e = _msk(w["end_utc"])
+        if s.month == e.month:
+            dates = f"{s.day}–{e.day} {MG[s.month]}"
+        else:
+            dates = f"{s.day} {MG[s.month]}–{e.day} {MG[e.month]}"
+        label = f"{w['flag']} {w['country']}, {w['city']}  ·  {dates}"
+        rnd   = len(past) - i   # номер раунда
+        rows.append([InlineKeyboardButton(label, callback_data=f"cal:past:{rnd}")])
+    rows.append(_home())
+    return InlineKeyboardMarkup(rows)
+
+def past_weekend_detail_kb(rnd: int):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔥 Квалификация", callback_data=f"cal:past_quali:{rnd}")],
+        _home(),
+    ])
+
 def back_kb(): return InlineKeyboardMarkup([_home()])
-def results_kb(): return InlineKeyboardMarkup([[InlineKeyboardButton("🔥 Квалификация",callback_data="res:quali"),InlineKeyboardButton("🏁 Гонка",callback_data="res:race")],_home()])
+def results_kb(): return InlineKeyboardMarkup([
+    [InlineKeyboardButton("🔥 Квалификация", callback_data="res:quali"),
+     InlineKeyboardButton("🏁 Гонка",         callback_data="res:race")],
+    _home(),
+])
+
+# ── HELPERS ───────────────────────────────────────────────────────────────────
+def _past_weekends():
+    now = datetime.now(tz=pytz.utc)
+    return [w for w in build_weekends() if w["end_utc"] < now]
+
+def _round_for_past(wks_past: list, rnd: int) -> Optional[dict]:
+    """rnd — 1-based, свежие сначала (reversed порядок)."""
+    ordered = list(reversed(wks_past))
+    if 1 <= rnd <= len(ordered):
+        return ordered[rnd - 1]
+    return None
 
 # ── HANDLERS ──────────────────────────────────────────────────────────────────
-async def cmd_start(upd:Update,ctx:ContextTypes.DEFAULT_TYPE):
-    chat=upd.effective_chat; priv=chat.type=="private"; subscribe(chat.id,priv)
-    desc=("⏰ Напоминания <b>за 30 мин</b> и <b>за 5 мин</b> до каждой сессии\n"
-          "🌡 Погода + местное время в напоминаниях\n"
-          "🔴 Live-события во время гонки\n"
-          "🏆 Результаты и чемпионат\n\n"
-          "Нажми <b>🔔 Включить уведомления</b> чтобы получать их!" if priv
-          else "Этот чат добавлен — уведомления будут приходить сюда!\n\nИспользуй /start для меню.")
-    await upd.message.reply_text("🏠",reply_markup=REPLY_KB)
-    await upd.message.reply_text(f"🏎️ <b>F1 2026 — бот уведомлений</b>\n\n{desc}",
-                                  parse_mode="HTML",reply_markup=main_kb(chat.id,priv))
+async def cmd_start(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat = upd.effective_chat; priv = chat.type == "private"
+    subscribe(chat.id, priv)
+    desc = (
+        "⏰ Напоминания <b>за 30 мин</b> и <b>за 5 мин</b> до каждой сессии\n"
+        "🌡 Погода + местное время в напоминаниях\n"
+        "🔴 Live-события во время гонки\n"
+        "🏆 Результаты и чемпионат\n\n"
+        "Нажми <b>🔔 Уведомления — выкл</b> чтобы включить!"
+        if priv else
+        "Этот чат добавлен — уведомления будут приходить сюда!\n\nИспользуй /start для меню."
+    )
+    await upd.message.reply_text("🏠", reply_markup=REPLY_KB)
+    await upd.message.reply_text(
+        f"🏎️ <b>F1 2026 — бот уведомлений</b>\n\n{desc}",
+        parse_mode="HTML", reply_markup=main_kb(chat.id, priv)
+    )
 
-async def on_menu(upd:Update,ctx:ContextTypes.DEFAULT_TYPE):
-    chat=upd.effective_chat; priv=chat.type=="private"
-    await upd.message.reply_text("🏎️ <b>F1 2026 — главное меню</b>",parse_mode="HTML",reply_markup=main_kb(chat.id,priv))
+async def on_menu(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat = upd.effective_chat; priv = chat.type == "private"
+    # Удаляем сообщение пользователя «🏠 Меню»
+    try:
+        await upd.message.delete()
+    except Exception:
+        pass
+    await upd.message.reply_text(
+        "🏎️ <b>F1 2026 — главное меню</b>",
+        parse_mode="HTML", reply_markup=main_kb(chat.id, priv)
+    )
 
-async def cmd_status(upd:Update,ctx:ContextTypes.DEFAULT_TYPE):
-    d=_load(); now=datetime.now(tz=MSK); live="✅ активен" if (_monitor and _monitor.running) else "💤 не активен"
-    await upd.message.reply_text(f"📊 <b>Статус бота</b>\n\n👤 Личных: {len(d['users'])}\n💬 Чатов: {len(d['chats'])}\n🔕 Выключили: {len(d.get('muted',[]))}\n⏰ Напоминаний: {len(scheduler.get_jobs())}\n🔴 Live: {live}\n🕐 {now.strftime('%d.%m.%Y %H:%M')} МСК",parse_mode="HTML")
+async def cmd_status(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    d   = _load(); now = datetime.now(tz=MSK)
+    live = "✅ активен" if (_monitor and _monitor.running) else "💤 не активен"
+    await upd.message.reply_text(
+        f"📊 <b>Статус бота</b>\n\n"
+        f"👤 Личных: {len(d['users'])}\n"
+        f"💬 Чатов: {len(d['chats'])}\n"
+        f"🔕 Выключили: {len(d.get('muted',[]))}\n"
+        f"⏰ Напоминаний: {len(scheduler.get_jobs())}\n"
+        f"🔴 Live: {live}\n"
+        f"🕐 {now.strftime('%d.%m.%Y %H:%M')} МСК",
+        parse_mode="HTML"
+    )
 
-async def on_cb(upd:Update,ctx:ContextTypes.DEFAULT_TYPE):
-    q:CallbackQuery=upd.callback_query; await q.answer()
-    data=q.data; chat=upd.effective_chat; priv=chat.type=="private"
+async def on_cb(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q: CallbackQuery = upd.callback_query
+    await q.answer()
+    data = q.data
+    chat = upd.effective_chat
+    priv = chat.type == "private"
 
-    if data=="close":
+    # ── Закрыть ───────────────────────────────────────────────────────────────
+    if data == "close":
         try: await q.message.delete()
         except: await q.edit_message_reply_markup(reply_markup=None)
         return
 
-    if data=="home":
-        await q.edit_message_text("🏎️ <b>F1 2026 — главное меню</b>",parse_mode="HTML",reply_markup=main_kb(chat.id,priv)); return
+    # ── Главное меню ──────────────────────────────────────────────────────────
+    if data == "home":
+        await q.edit_message_text(
+            "🏎️ <b>F1 2026 — главное меню</b>",
+            parse_mode="HTML", reply_markup=main_kb(chat.id, priv)
+        ); return
 
-    if data=="notif_toggle" and priv:
-        enabled=toggle_notif(chat.id,True)
-        await q.answer("✅ Уведомления включены!" if enabled else "☑️ Уведомления выключены",show_alert=True)
-        await q.edit_message_reply_markup(reply_markup=main_kb(chat.id,True)); return
+    # ── Уведомления ───────────────────────────────────────────────────────────
+    if data == "notif_toggle" and priv:
+        enabled = toggle_notif(chat.id, True)
+        await q.answer("✅ Уведомления включены!" if enabled else "☑️ Уведомления выключены", show_alert=True)
+        await q.edit_message_reply_markup(reply_markup=main_kb(chat.id, True)); return
 
-    if data=="cal:current":
-        wks=build_weekends(); w=cur_weekend(wks) or nxt_weekend(wks)
-        if not w: await q.edit_message_text("😔 Нет данных.",reply_markup=back_kb()); return
-        await q.edit_message_text("⏳ Загружаю...",parse_mode="HTML")
-        text=await fmt_cur_weekend(w); await q.edit_message_text(text[:4090],parse_mode="HTML",reply_markup=back_kb()); return
+    # ── Ближайшее событие ─────────────────────────────────────────────────────
+    if data == "cal:next_sess":
+        s = nxt_session(build_weekends())
+        if not s:
+            await q.edit_message_text("😔 Нет предстоящих событий.", reply_markup=back_kb()); return
+        await q.edit_message_text("⏳ Загружаю погоду...", parse_mode="HTML")
+        text = await fmt_next_sess(s)
+        await q.edit_message_text(text[:4090], parse_mode="HTML", reply_markup=back_kb()); return
 
-    if data=="cal:next":
-        w=nxt_weekend(build_weekends())
-        if not w: await q.edit_message_text("😔 Нет предстоящих уикендов.",reply_markup=back_kb()); return
-        await q.edit_message_text(fmt_card(w, show_done=False),parse_mode="HTML",reply_markup=back_kb()); return
+    # ── Этот уикенд (с кнопками результатов) ─────────────────────────────────
+    if data == "cal:current":
+        wks = build_weekends(); w = cur_weekend(wks) or nxt_weekend(wks)
+        if not w:
+            await q.edit_message_text("😔 Нет данных.", reply_markup=back_kb()); return
+        await q.edit_message_text("⏳ Загружаю...", parse_mode="HTML")
+        text = await fmt_cur_weekend_with_results(w)
+        await q.edit_message_text(text[:4090], parse_mode="HTML", reply_markup=cur_weekend_kb()); return
 
-    if data=="cal:next_sess":
-        s=nxt_session(build_weekends())
-        if not s: await q.edit_message_text("😔 Нет предстоящих событий.",reply_markup=back_kb()); return
-        await q.edit_message_text("⏳ Загружаю погоду...",parse_mode="HTML")
-        text=await fmt_next_sess(s); await q.edit_message_text(text[:4090],parse_mode="HTML",reply_markup=back_kb()); return
+    # ── Следующий уикенд ──────────────────────────────────────────────────────
+    if data == "cal:next":
+        w = nxt_weekend(build_weekends())
+        if not w:
+            await q.edit_message_text("😔 Нет предстоящих уикендов.", reply_markup=back_kb()); return
+        await q.edit_message_text(fmt_card(w, show_done=False), parse_mode="HTML", reply_markup=back_kb()); return
 
-    if data=="cal:months":
-        wks=build_weekends()
-        await q.edit_message_text("📅 <b>Выбери месяц:</b>",parse_mode="HTML",reply_markup=months_kb(wks)); return
+    # ── Календарь: выбор месяца ────────────────────────────────────────────────
+    if data == "cal:months":
+        wks = build_weekends()
+        await q.edit_message_text(
+            "📅 <b>Выбери месяц:</b>", parse_mode="HTML", reply_markup=months_kb(wks)
+        ); return
 
     if data.startswith("cal:month:"):
-        ym=data.split(":",2)[2]; year=int(ym.split("-")[0]); month=int(ym.split("-")[1])
-        wks=build_weekends(); text=fmt_month(wks,year,month)
-        await q.edit_message_text(text,parse_mode="HTML",reply_markup=month_nav_kb(wks,year,month)); return
+        ym    = data.split(":", 2)[2]
+        year  = int(ym.split("-")[0]); month = int(ym.split("-")[1])
+        wks   = build_weekends()
+        text  = fmt_month(wks, year, month)
+        await q.edit_message_text(text, parse_mode="HTML", reply_markup=month_nav_kb(wks, year, month)); return
 
-    if data=="res:standings":
-        await q.edit_message_text("⏳ Загружаю...",parse_mode="HTML")
-        await q.edit_message_text((await fmt_standings())[:4090],parse_mode="HTML",reply_markup=back_kb()); return
+    # ── Прошедшие уикенды ─────────────────────────────────────────────────────
+    if data == "cal:past":
+        past = _past_weekends()
+        if not past:
+            await q.edit_message_text("😔 Ещё не прошло ни одного уикенда.", reply_markup=back_kb()); return
+        await q.edit_message_text(
+            "🕰 <b>Прошедшие уикенды:</b>", parse_mode="HTML",
+            reply_markup=past_weekends_kb(past)
+        ); return
 
-    if data=="res:menu":
-        await q.edit_message_text("📊 <b>Выбери тип результатов:</b>",parse_mode="HTML",reply_markup=results_kb()); return
+    if data.startswith("cal:past:") and not data.startswith("cal:past_quali:"):
+        rnd  = int(data.split(":")[-1])
+        past = _past_weekends()
+        w    = _round_for_past(past, rnd)
+        if not w:
+            await q.edit_message_text("😔 Уикенд не найден.", reply_markup=back_kb()); return
+        await q.edit_message_text("⏳ Загружаю результаты...", parse_mode="HTML")
+        text = await fmt_past_weekend(w, rnd)
+        await q.edit_message_text(
+            text[:4090], parse_mode="HTML",
+            reply_markup=past_weekend_detail_kb(rnd)
+        ); return
 
-    if data=="res:quali":
-        await q.edit_message_text("⏳ Загружаю...",parse_mode="HTML")
-        await q.edit_message_text((await fmt_quali())[:4090],parse_mode="HTML",reply_markup=back_kb()); return
+    if data.startswith("cal:past_quali:"):
+        rnd  = int(data.split(":")[-1])
+        past = _past_weekends()
+        w    = _round_for_past(past, rnd)
+        if not w:
+            await q.edit_message_text("😔 Уикенд не найден.", reply_markup=back_kb()); return
+        await q.edit_message_text("⏳ Загружаю квалификацию...", parse_mode="HTML")
+        text = await fmt_past_quali(w, rnd)
+        await q.edit_message_text(
+            text[:4090], parse_mode="HTML",
+            reply_markup=past_weekend_detail_kb(rnd)
+        ); return
 
-    if data=="res:race":
-        await q.edit_message_text("⏳ Загружаю...",parse_mode="HTML")
-        await q.edit_message_text((await fmt_race())[:4090],parse_mode="HTML",reply_markup=back_kb()); return
+    # ── Чемпионат ─────────────────────────────────────────────────────────────
+    if data == "res:standings":
+        await q.edit_message_text("⏳ Загружаю...", parse_mode="HTML")
+        await q.edit_message_text(
+            (await fmt_standings())[:4090], parse_mode="HTML", reply_markup=back_kb()
+        ); return
+
+    # ── Результаты (квали/гонка) — из текущего уикенда ───────────────────────
+    if data == "res:quali":
+        await q.edit_message_text("⏳ Загружаю...", parse_mode="HTML")
+        await q.edit_message_text(
+            (await fmt_quali())[:4090], parse_mode="HTML", reply_markup=cur_weekend_kb()
+        ); return
+
+    if data == "res:race":
+        await q.edit_message_text("⏳ Загружаю...", parse_mode="HTML")
+        await q.edit_message_text(
+            (await fmt_race())[:4090], parse_mode="HTML", reply_markup=cur_weekend_kb()
+        ); return
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 async def post_init(app:Application):
