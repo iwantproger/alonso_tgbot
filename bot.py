@@ -740,6 +740,182 @@ def fmt_month(wks,year,month):
     cards = sep.join(fmt_card(w, show_done=True) for w in mwks)
     return (hdr + cards)[:4090]
 
+async def fmt_stroll_stats() -> str:
+    """
+    Полная статистика Лэнса Стролла:
+    — последняя гонка (позиция, старт, очки, сход, быстрый круг)
+    — последняя квалификация
+    — сезонный итог по всем прошедшим раундам
+    """
+    year = datetime.now(tz=pytz.utc).year
+    now  = datetime.now(tz=pytz.utc)
+
+    # Параллельно: последняя гонка + квали + все раунды для сезонной статистики
+    (rname, _, race_results), (qname, _, q_results), stds = await asyncio.gather(
+        last_race(), last_quali(), driver_standings(), return_exceptions=True
+    )
+    if isinstance(race_results, Exception): race_results = []
+    if isinstance(q_results,   Exception): q_results    = []
+    if isinstance(stds,        Exception): stds         = []
+
+    lines = ["🟦 <b>Лэнс Стролл (Aston Martin) — статистика</b>\n"]
+
+    # ── СЕЗОН (из таблицы чемпионата) ───────────────────────────────────────
+    past = [w for w in build_weekends() if w["end_utc"] < now]
+    stroll_season = next((s for s in stds if s["Driver"]["familyName"]=="Stroll"), None)
+
+    if stroll_season:
+        sp   = stroll_season
+        spos = sp.get("position") or sp.get("positionText","—")
+        spts = sp.get("points","0")
+        swins= sp.get("wins","0")
+        lines.append(f"📊 <b>Сезон 2026 — итог ({len(past)} гонок):</b>")
+        lines.append(f"  🏆 Место в чемпионате: <b>P{spos}</b>")
+        lines.append(f"  💎 Набрано очков: <b>{spts}</b>")
+        if swins and swins != "0":
+            lines.append(f"  🥇 Побед: {swins}")
+    else:
+        lines.append(f"📊 <b>Сезон 2026 ({len(past)} гонок)</b>")
+
+    # Считаем детальную статистику по всем раундам
+    if past:
+        tasks   = [race_by_round(year, rnd) for rnd in range(1, len(past)+1)]
+        rounds  = await asyncio.gather(*tasks, return_exceptions=True)
+
+        dnf_count   = 0
+        podiums     = 0
+        points_list = []
+        best_pos    = 99
+        pos_history = []
+
+        for res in rounds:
+            if isinstance(res, Exception) or not res: continue
+            _, results = res
+            sr = next((r for r in results if r["Driver"]["familyName"]=="Stroll"), None)
+            if not sr: continue
+            pos    = int(sr.get("position", 99))
+            pts    = float(sr.get("points", 0) or 0)
+            status = sr.get("status","Finished")
+            is_dnf = status not in ("Finished","+1 Lap","+2 Laps","+3 Laps","+3 Laps","+4 Laps")
+            if is_dnf:    dnf_count += 1
+            if pos <= 3:  podiums   += 1
+            if pos < best_pos: best_pos = pos
+            points_list.append(pts)
+            pos_history.append((pos, is_dnf))
+
+        avg_pts = sum(points_list)/len(points_list) if points_list else 0
+        scored  = sum(1 for p in points_list if p > 0)
+
+        lines.append(f"  📈 Очков в среднем за гонку: {avg_pts:.1f}")
+        lines.append(f"  ✅ Финишей в очках: {scored} из {len(points_list)}")
+        lines.append(f"  ❌ Сходов: {dnf_count}")
+        if podiums: lines.append(f"  🏆 Подиумов: {podiums}")
+        if best_pos < 99: lines.append(f"  ⭐ Лучший результат: P{best_pos}")
+
+        # История позиций (компактно)
+        if pos_history:
+            hist = []
+            for pos, dnf in pos_history:
+                if dnf:      hist.append("❌")
+                elif pos==1: hist.append("🥇")
+                elif pos==2: hist.append("🥈")
+                elif pos==3: hist.append("🥉")
+                elif pos<=10:hist.append(f"P{pos}")
+                else:        hist.append(f"<i>P{pos}</i>")
+            lines.append(f"  📋 По гонкам: {' · '.join(hist)}")
+
+    lines.append("")
+
+    # ── ПОСЛЕДНЯЯ ГОНКА ──────────────────────────────────────────────────────
+    sr = next((r for r in race_results if r["Driver"]["familyName"]=="Stroll"), None)
+    if sr and rname:
+        pm     = {s["Driver"]["driverId"]:s["points"] for s in stds}
+        d      = sr["Driver"]
+        pos    = int(sr.get("position",0) or 0)
+        pts    = sr.get("points","0")
+        total  = pm.get(d["driverId"],"—")
+        status = sr.get("status","Finished")
+        laps   = int(sr.get("laps","0") or 0)
+        grid   = int(sr.get("grid","0") or 0)
+        dnf    = status not in ("Finished","+1 Lap","+2 Laps","+3 Laps")
+
+        qpos_map = {r["Driver"]["driverId"]: int(r["position"]) for r in q_results} if q_results else {}
+        q_pos  = qpos_map.get(d["driverId"], grid)
+
+        if q_pos and pos:
+            delta = q_pos - pos
+            if delta > 0:   chg = f"+{delta} ↑ (P{q_pos}→P{pos})"
+            elif delta < 0: chg = f"{delta} ↓ (P{q_pos}→P{pos})"
+            else:           chg = f"без изменений (P{pos})"
+        else:
+            chg = f"P{pos}"
+
+        winner = race_results[0] if race_results else None
+        gap_to_win = sr.get("Time",{}).get("time","") if pos > 1 else ""
+        fl_data = sr.get("FastestLap")
+
+        lines.append(f"🏁 <b>Последняя гонка: {rname}</b>")
+        lines.append(f"  🏁 Старт: <b>P{grid}</b> (квали P{q_pos})  →  Финиш: <b>P{pos}</b>")
+        lines.append(f"  📊 Изменение позиций: {chg}")
+        if dnf:
+            lines.append(f"  ❌ <b>СХОД!</b> Причина: {status}  ·  Кругов: {laps}")
+        else:
+            lines.append(f"  ✅ Финишировал  ·  Кругов: {laps}")
+            if gap_to_win and winner:
+                lines.append(f"  📏 До победителя ({winner['Driver']['familyName']}): +{gap_to_win}")
+        lines.append(f"  💎 Очков: +{pts}  ·  Итого: {total}")
+        if fl_data:
+            fl_t = fl_data.get("Time",{}).get("time","")
+            fl_r = fl_data.get("rank","")
+            if fl_t:
+                icon = "⚡" if str(fl_r)=="1" else "🕐"
+                extra = " — <b>БЫСТРЕЙШИЙ КРУГ!</b>" if str(fl_r)=="1" else f" (ранг {fl_r})"
+                lines.append(f"  {icon} Быстрый круг: <code>{fl_t}</code>{extra}")
+
+        # Контекст выступления
+        lines.append("")
+        if dnf:
+            lines.append("  📌 <i>Сход — очки потеряны</i>")
+        elif pos == 1:
+            lines.append("  📌 <i>Победа! 🎉</i>")
+        elif pos <= 3:
+            lines.append("  📌 <i>Подиум — отличный результат</i>")
+        elif pos <= 10:
+            lines.append("  📌 <i>Финиш в очках</i>")
+        else:
+            lines.append("  📌 <i>За пределами очков</i>")
+
+    lines.append("")
+
+    # ── ПОСЛЕДНЯЯ КВАЛИФИКАЦИЯ ────────────────────────────────────────────────
+    sq = next((r for r in q_results if r["Driver"]["familyName"]=="Stroll"), None)
+    if sq and qname:
+        qp   = int(sq.get("position",0) or 0)
+        q1t  = sq.get("Q1","—"); q2t = sq.get("Q2","—"); q3t = sq.get("Q3","—")
+        best = q3t if q3t!="—" else (q2t if q2t!="—" else q1t)
+        reached = "Q3 🟢" if q3t!="—" else ("Q2 🟡" if q2t!="—" else "Q1 🔴")
+
+        # Сравниваем с напарником Альборном/напарником Aston Martin
+        teammate = next((r for r in q_results
+                         if r["Constructor"]["name"] == sq["Constructor"]["name"]
+                         and r["Driver"]["familyName"] != "Stroll"), None)
+        tm_str = ""
+        if teammate:
+            tm_pos = int(teammate.get("position",0) or 0)
+            tm_last= teammate["Driver"]["familyName"]
+            tm_best= teammate.get("Q3") or teammate.get("Q2") or teammate.get("Q1") or "—"
+            diff   = tm_pos - qp   # >0 = Стролл лучше
+            if diff > 0:   tm_str = f"  ·  лучше {tm_last} на {diff} поз. ✅"
+            elif diff < 0: tm_str = f"  ·  хуже {tm_last} на {-diff} поз. ⚠️"
+            else:          tm_str = f"  ·  наравне с {tm_last}"
+
+        lines.append(f"🔥 <b>Последняя квали: {qname}</b>")
+        lines.append(f"  📍 Позиция: <b>P{qp}</b>  ·  Дошёл до: <b>{reached}</b>{tm_str}")
+        lines.append(f"  ⏱ Q1: <code>{q1t}</code>  ·  Q2: <code>{q2t}</code>  ·  Q3: <code>{q3t}</code>")
+        lines.append(f"  🏆 Лучшее: <code>{best}</code>")
+
+    return "\n".join(lines)
+
 async def fmt_cur_weekend(w):
     lines=["🏁 <b>Текущий / ближайший гоночный уикенд</b>\n",fmt_card(w, show_done=True)]
     stds=await driver_standings()
@@ -1574,6 +1750,7 @@ def main_kb(cid, priv):
         [InlineKeyboardButton("🗓 Календарь всех событий",  callback_data="cal:months")],
         [InlineKeyboardButton("🕰 Прошедшие уикенды",       callback_data="cal:past")],
         [InlineKeyboardButton("🏆 Баллы за сезон",          callback_data="res:standings")],
+        [InlineKeyboardButton("🟦 Статистика Стролла",       callback_data="res:stroll")],
         [InlineKeyboardButton("✖️ Закрыть",                  callback_data="close")],
     ]
     return InlineKeyboardMarkup(rows)
@@ -1839,6 +2016,9 @@ async def on_cb(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ── Чемпионат ─────────────────────────────────────────────────────────────
     if data == "res:standings":
         await run_with_cancel(q, "Загружаю баллы за сезон...", fmt_standings()); return
+
+    if data == "res:stroll":
+        await run_with_cancel(q, "Загружаю статистику Стролла...", fmt_stroll_stats()); return
 
     # ── Результаты (квали/гонка) — из текущего уикенда ───────────────────────
     if data == "res:quali":
