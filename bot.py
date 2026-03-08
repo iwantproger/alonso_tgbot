@@ -801,18 +801,29 @@ async def fmt_standings():
         return "❌ Данные чемпионата недоступны — результаты гонок ещё не опубликованы"
     lines = ["🏆 <b>Чемпионат гонщиков 2026</b>\n"]
     medals = {1:"🥇", 2:"🥈", 3:"🥉"}
-    for s in stds[:20]:
-        d     = s["Driver"]
-        team  = (s.get("Constructors") or [{}])[0].get("name","—")
-        pos   = int(s["position"])
-        pts   = s["points"]
-        wins  = s.get("wins","0")
-        flag  = driver_emoji(d.get("familyName",""))
-        name  = f"{d.get('givenName','')} {d.get('familyName','')}".strip()
-        medal = medals.get(pos, "")
-        w_str = f"  ·  🏆 {wins} побед{'а' if wins=='1' else ''}" if wins and wins != "0" else ""
-        # Строка: очки впереди — самое важное
-        lines.append(f"  {pos:>2}. <b>{pts} очк.</b>  {medal}{flag} {name} ({team}){w_str}")
+    for i, s in enumerate(stds[:20], 1):
+        try:
+            d    = s["Driver"]
+            team = (s.get("Constructors") or [{}])[0].get("name","—")
+            # Jolpica использует "positionText" или "position" — берём что есть
+            pos_raw = s.get("position") or s.get("positionText") or str(i)
+            try:
+                pos = int(pos_raw)
+            except (ValueError, TypeError):
+                pos = i
+            pts  = s.get("points", "0")
+            wins = s.get("wins", "0")
+            flag = driver_emoji(d.get("familyName",""))
+            name = f"{d.get('givenName','')} {d.get('familyName','')}".strip()
+            medal = medals.get(pos, "  ")
+            w_str = f"  🏆 {wins}п" if wins and wins not in ("0","") else ""
+            lines.append(
+                f"  {pos:>2}. <b>{pts} очк.</b>  {medal} {flag} {name}\n"
+                f"        ({team}){w_str}"
+            )
+        except Exception as e:
+            log.warning("fmt_standings row %d: %s", i, e)
+            continue
     return "\n".join(lines)
 
 async def fmt_quali():
