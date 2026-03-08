@@ -422,60 +422,67 @@ async def driver_standings():
 
 async def _standings_from_results() -> list:
     """
-    Строим таблицу чемпионата суммируя очки из результатов каждой гонки.
-    Параллельно запрашиваем раунды 1..24 (пропускаем пустые).
+    Строим таблицу чемпионата из тех же данных что уже работают в боте.
+    Используем /current/last/results.json (работает всегда если есть хоть одна гонка),
+    затем добираем предыдущие раунды через /current/{n}/results.json.
     """
     year = datetime.now(tz=pytz.utc).year
 
-    # Узнаём сколько раундов уже прошло через last_race
-    _, rdate, last_results = await last_race()
+    # Шаг 1: last_race() — тот же вызов что работает в "Этот уикенд"
+    rname, rdate, last_results = await last_race()
     if not last_results:
-        log.warning("_standings_from_results: last_race вернула пусто")
+        log.warning("_standings_from_results: last_race пустая")
         return []
 
-    # Определяем последний раунд из URL Jolpica (через /current/last)
+    # Узнаём номер последнего раунда
     d_last = await jget("/current/last/results.json")
-    if not d_last:
-        return []
-    try:
-        last_rnd = int(d_last["MRData"]["RaceTable"].get("round", "1"))
-    except Exception:
-        last_rnd = 1
-
-    log.info("_standings_from_results: строим из %d раундов", last_rnd)
-
-    # Параллельно тянем все раунды
-    tasks = [jget(f"/{year}/{rnd}/results.json") for rnd in range(1, last_rnd + 1)]
-    results_raw = await asyncio.gather(*tasks, return_exceptions=True)
-
-    pts: dict = {}
-    for raw in results_raw:
-        if not raw or isinstance(raw, Exception):
-            continue
+    last_rnd = 1
+    if d_last:
         try:
-            races = raw["MRData"]["RaceTable"]["Races"]
+            last_rnd = int(d_last["MRData"]["RaceTable"].get("round", "1"))
         except Exception:
-            continue
-        for race in races:
-            for r in race.get("Results", []):
-                d_obj = r["Driver"]
-                did   = d_obj["driverId"]
-                p     = float(r.get("points", 0) or 0)
-                if did not in pts:
-                    pts[did] = {
-                        "Driver":       d_obj,
-                        "Constructors": [r.get("Constructor", {})],
-                        "points":       0.0,
-                        "wins":         0,
-                    }
-                pts[did]["points"] += p
-                if r.get("position") == "1":
-                    pts[did]["wins"] += 1
-                pts[did]["Constructors"] = [r.get("Constructor", {})]
+            pass
 
-    if not pts:
-        log.warning("_standings_from_results: pts пустой после обработки раундов")
-        return []
+    log.info("_standings_from_results: последний раунд %d, строим таблицу", last_rnd)
+
+    # Шаг 2: параллельно тянем все раунды по номеру
+    if last_rnd == 1:
+        all_rounds = [last_results]
+    else:
+        tasks = [jget(f"/{year}/{rnd}/results.json") for rnd in range(1, last_rnd + 1)]
+        raws  = await asyncio.gather(*tasks, return_exceptions=True)
+        all_rounds = []
+        for raw in raws:
+            if isinstance(raw, Exception) or not raw:
+                continue
+            try:
+                races = raw["MRData"]["RaceTable"]["Races"]
+                for race in races:
+                    all_rounds.append(race.get("Results", []))
+            except Exception:
+                continue
+        if not all_rounds:
+            # Если ничего не получили — используем хотя бы last_race
+            all_rounds = [last_results]
+
+    # Шаг 3: агрегируем очки
+    pts: dict = {}
+    for results in all_rounds:
+        for r in results:
+            d_obj = r["Driver"]
+            did   = d_obj["driverId"]
+            p     = float(r.get("points", 0) or 0)
+            if did not in pts:
+                pts[did] = {
+                    "Driver":       d_obj,
+                    "Constructors": [r.get("Constructor", {})],
+                    "points":       0.0,
+                    "wins":         0,
+                }
+            pts[did]["points"] += p
+            if r.get("position") == "1":
+                pts[did]["wins"] += 1
+            pts[did]["Constructors"] = [r.get("Constructor", {})]
 
     sorted_d = sorted(pts.values(), key=lambda x: -x["points"])
     for i, s in enumerate(sorted_d, 1):
@@ -483,6 +490,8 @@ async def _standings_from_results() -> list:
         p = s["points"]
         s["points"] = str(int(p) if p == int(p) else p)
         s["wins"]   = str(s["wins"])
+
+    log.info("_standings_from_results: готово, %d гонщиков", len(sorted_d))
     return sorted_d
 
 async def last_quali():
