@@ -403,10 +403,66 @@ async def jget(path):
     return None
 
 async def driver_standings():
-    d=await jget("/current/driverStandings.json")
-    if not d: return []
-    lst=d["MRData"]["StandingsTable"]["StandingsLists"]
-    return lst[0]["DriverStandings"] if lst else []
+    """Пробуем Jolpica /driverStandings, при неудаче строим сами из результатов."""
+    d = await jget("/current/driverStandings.json")
+    if d:
+        lst = d["MRData"]["StandingsTable"]["StandingsLists"]
+        if lst and lst[0].get("DriverStandings"):
+            return lst[0]["DriverStandings"]
+    # Fallback: строим из результатов всех прошедших гонок
+    return await _standings_from_results()
+
+async def _standings_from_results() -> list:
+    """
+    Собираем таблицу чемпионата из результатов Jolpica по раундам.
+    Запрашиваем раунды параллельно, пока не кончатся данные.
+    """
+    year = datetime.now(tz=pytz.utc).year
+
+    # Сначала узнаём сколько раундов прошло через /current/last
+    d = await jget(f"/{year}/results.json?limit=1")
+    if not d:
+        return []
+    total_rounds_str = d["MRData"].get("total","0")
+    # Jolpica /year/results.json без round возвращает все гонки
+    d_all = await jget(f"/{year}/results.json?limit=100")
+    if not d_all:
+        return []
+    races = d_all["MRData"]["RaceTable"]["Races"]
+    if not races:
+        return []
+
+    # Агрегируем очки: driverId → {info, points, wins, team}
+    pts: dict = {}
+    for race in races:
+        for r in race.get("Results", []):
+            d_obj  = r["Driver"]
+            did    = d_obj["driverId"]
+            p      = float(r.get("points", 0) or 0)
+            team   = r.get("Constructor", {}).get("name", "—")
+            if did not in pts:
+                pts[did] = {
+                    "Driver":       d_obj,
+                    "Constructors": [r.get("Constructor", {})],
+                    "points":       0.0,
+                    "wins":         0,
+                    "rounds":       0,
+                }
+            pts[did]["points"] += p
+            pts[did]["rounds"] += 1
+            if r.get("position") == "1":
+                pts[did]["wins"] += 1
+            # Обновляем команду на последнюю известную
+            pts[did]["Constructors"] = [r.get("Constructor", {})]
+
+    # Сортируем по очкам убывая, присваиваем позиции
+    sorted_drivers = sorted(pts.values(), key=lambda x: -x["points"])
+    for i, s in enumerate(sorted_drivers, 1):
+        s["position"] = str(i)
+        s["points"]   = str(int(s["points"]) if s["points"] == int(s["points"]) else s["points"])
+        s["wins"]     = str(s["wins"])
+
+    return sorted_drivers
 
 async def last_quali():
     """Возвращает (raceName, date_str, results)."""
@@ -710,18 +766,23 @@ async def fmt_next_sess(sess):
     return "\n".join(lines)
 
 async def fmt_standings():
-    stds=await driver_standings()
-    if not stds: return "❌ Данные чемпионата ещё недоступны — сезон не начался"
-    lines=["🏆 <b>Чемпионат гонщиков 2026</b>\n"]
+    stds = await driver_standings()
+    if not stds:
+        return "❌ Данные чемпионата недоступны — результаты гонок ещё не опубликованы"
+    lines = ["🏆 <b>Чемпионат гонщиков 2026</b>\n"]
+    medals = {1:"🥇", 2:"🥈", 3:"🥉"}
     for s in stds[:20]:
-        d    = s["Driver"]
-        team = (s.get("Constructors") or [{}])[0].get("name","—")
-        drv  = fmt_driver_jolpica(d, team)
-        pos  = int(s["position"])
-        wins = s.get("wins","0")
-        w_str = f"  ·  {wins} побед" if wins and wins != "0" else ""
-        lines.append(f"  {pos:>2}. {drv}")
-        lines.append(f"       {s['points']} очк.{w_str}")
+        d     = s["Driver"]
+        team  = (s.get("Constructors") or [{}])[0].get("name","—")
+        pos   = int(s["position"])
+        pts   = s["points"]
+        wins  = s.get("wins","0")
+        flag  = driver_emoji(d.get("familyName",""))
+        name  = f"{d.get('givenName','')} {d.get('familyName','')}".strip()
+        medal = medals.get(pos, "")
+        w_str = f"  ·  🏆 {wins} побед{'а' if wins=='1' else ''}" if wins and wins != "0" else ""
+        # Строка: очки впереди — самое важное
+        lines.append(f"  {pos:>2}. <b>{pts} очк.</b>  {medal}{flag} {name} ({team}){w_str}")
     return "\n".join(lines)
 
 async def fmt_quali():
