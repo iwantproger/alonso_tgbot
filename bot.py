@@ -391,10 +391,16 @@ def fmt_weather(w):
 # ── JOLPICA API ───────────────────────────────────────────────────────────────
 J="https://api.jolpi.ca/ergast/f1"
 async def jget(path):
-    try:
-        async with http.get(f"{J}{path}",timeout=aiohttp.ClientTimeout(total=8)) as r:
-            return await r.json(content_type=None)
-    except: return None
+    for attempt in range(3):
+        try:
+            async with http.get(f"{J}{path}", timeout=aiohttp.ClientTimeout(total=12)) as r:
+                if r.status == 200:
+                    return await r.json(content_type=None)
+        except Exception as e:
+            log.debug("jget %s attempt %d: %s", path, attempt+1, e)
+            if attempt < 2:
+                await asyncio.sleep(1)
+    return None
 
 async def driver_standings():
     d=await jget("/current/driverStandings.json")
@@ -403,18 +409,22 @@ async def driver_standings():
     return lst[0]["DriverStandings"] if lst else []
 
 async def last_quali():
+    """Возвращает (raceName, date_str, results)."""
     d=await jget("/current/last/qualifying.json")
-    if not d: return "",[]
+    if not d: return "","",[]
     races=d["MRData"]["RaceTable"]["Races"]
-    if not races: return "",[]
-    return races[0].get("raceName",""),races[0].get("QualifyingResults",[])
+    if not races: return "","",[]
+    r = races[0]
+    return r.get("raceName",""), r.get("date",""), r.get("QualifyingResults",[])
 
 async def last_race():
+    """Возвращает (raceName, date_str, results)."""
     d=await jget("/current/last/results.json")
-    if not d: return "",[]
+    if not d: return "","",[]
     races=d["MRData"]["RaceTable"]["Races"]
-    if not races: return "",[]
-    return races[0].get("raceName",""),races[0].get("Results",[])
+    if not races: return "","",[]
+    r = races[0]
+    return r.get("raceName",""), r.get("date",""), r.get("Results",[])
 
 async def race_by_round(season: int, rnd: int):
     d=await jget(f"/{season}/{rnd}/results.json")
@@ -559,6 +569,18 @@ _DRIVER_FLAG = {
 def driver_emoji(last_name: str) -> str:
     return _DRIVER_FLAG.get(last_name, "🏁")
 
+def fmt_driver(first: str, last: str, team: str = "", bold: bool = True) -> str:
+    """Единый формат гонщика: 🇲🇨 <b>Charles Leclerc</b> (Ferrari)"""
+    flag  = driver_emoji(last)
+    name  = f"{first} {last}".strip()
+    name_s = f"<b>{name}</b>" if bold else name
+    team_s = f" ({team})" if team else ""
+    return f"{flag} {name_s}{team_s}"
+
+def fmt_driver_jolpica(d: dict, team: str = "", bold: bool = True) -> str:
+    """Форматирует гонщика из Jolpica dict с ключами givenName/familyName."""
+    return fmt_driver(d.get("givenName",""), d.get("familyName",""), team, bold)
+
 
 # ── FORMATTERS ────────────────────────────────────────────────────────────────
 def _msk(dt): return dt.astimezone(MSK)
@@ -657,19 +679,14 @@ async def fmt_next_sess(sess):
     lines.append(fmt_weather_block(wdata, target_dt=sess["start_utc"]))
 
     if is_race:
-        _, qr = await last_quali()
+        _, _qdate, qr = await last_quali()
         if qr:
             lines.append("\n🏁 <b>Стартовая решётка:</b>")
-            for q in qr:   # все гонщики, не только топ-10
-                d      = q["Driver"]
-                last   = d["familyName"]
-                demoji = driver_emoji(last)
-                team   = q["Constructor"]["name"]
-                best   = q.get("Q3") or q.get("Q2") or q.get("Q1") or "—"
-                lines.append(
-                    f"  <b>P{q['position']}</b>  {demoji} {d['givenName'][0]}. {last}"
-                    f"  ({team})  <code>{best}</code>"
-                )
+            for q in qr:
+                d    = q["Driver"]
+                drv  = fmt_driver_jolpica(d, q["Constructor"]["name"])
+                best = q.get("Q3") or q.get("Q2") or q.get("Q1") or "—"
+                lines.append(f"  <b>P{q['position']}</b>  {drv}  <code>{best}</code>")
 
     return "\n".join(lines)
 
@@ -678,64 +695,191 @@ async def fmt_standings():
     if not stds: return "❌ Данные чемпионата ещё недоступны — сезон не начался"
     lines=["🏆 <b>Чемпионат гонщиков 2026</b>\n"]
     for s in stds[:20]:
-        d=s["Driver"]; team=(s.get("Constructors") or [{}])[0].get("name","—")
-        lines.append(f"{int(s['position']):>2}. <b>{d['givenName'][0]}. {d['familyName']}</b> ({team}) — {s['points']} очк.")
+        d    = s["Driver"]
+        team = (s.get("Constructors") or [{}])[0].get("name","—")
+        drv  = fmt_driver_jolpica(d, team)
+        lines.append(f"  {int(s['position']):>2}. {drv} — {s['points']} очк.")
     return "\n".join(lines)
 
 async def fmt_quali():
-    rname,results=await last_quali()
+    rname,_,results=await last_quali()
     if not results: return "❌ Результаты квалификации недоступны — сезон ещё не начался"
     lines=[f"🔥 <b>Квалификация — {rname}</b>\n"]
     q3=[r for r in results if r.get("Q3")]
     q2=[r for r in results if r.get("Q2") and not r.get("Q3")]
     q1=[r for r in results if not r.get("Q2")]
     if q3:
-        lines.append("✅ <b>Q3 — проходят в топ-10:</b>")
+        lines.append("✅ <b>Q3:</b>")
         for r in q3:
-            d=r["Driver"]
-            lines.append(f"  {r['position']}. <b>{d['givenName'][0]}. {d['familyName']}</b> ({r['Constructor']['name']})  {r['Q3']}")
+            d   = r["Driver"]
+            drv = fmt_driver_jolpica(d, r["Constructor"]["name"])
+            lines.append(f"  {r['position']:>2}. {drv}  <code>{r['Q3']}</code>")
     if q2:
         lines.append("\n⚠️ <b>Выбыли в Q2:</b>")
-        for r in q2: d=r["Driver"]; lines.append(f"  {r['position']}. {d['givenName'][0]}. {d['familyName']}  {r['Q2']}")
+        for r in q2:
+            d   = r["Driver"]
+            drv = fmt_driver_jolpica(d, r["Constructor"]["name"], bold=False)
+            lines.append(f"  {r['position']:>2}. {drv}  <code>{r['Q2']}</code>")
     if q1:
         lines.append("\n❌ <b>Выбыли в Q1:</b>")
-        for r in q1: d=r["Driver"]; lines.append(f"  {r['position']}. {d['givenName'][0]}. {d['familyName']}  {r.get('Q1','—')}")
-    for r in results:
-        if r["Driver"]["familyName"]=="Leclerc":
-            lines.append(f"\n\n🔴 <b>Шарль Леклер — Scuderia Ferrari</b>")
-            lines.append(f"  Позиция: P{r['position']}")
-            lines.append(f"  Q1: {r.get('Q1','—')} · Q2: {r.get('Q2','—')} · Q3: {r.get('Q3','—')}")
+        for r in q1:
+            d   = r["Driver"]
+            drv = fmt_driver_jolpica(d, r["Constructor"]["name"], bold=False)
+            lines.append(f"  {r['position']:>2}. {drv}  <code>{r.get('Q1','—')}</code>")
+
+    # ── Аналитика Леклера ────────────────────────────────────────────────────
+    lec = next((r for r in results if r["Driver"]["familyName"]=="Leclerc"), None)
+    if lec:
+        d   = lec["Driver"]
+        pos = int(lec["position"])
+        q1t = lec.get("Q1","—"); q2t = lec.get("Q2","—"); q3t = lec.get("Q3","—")
+        # Лучшее время
+        best_t = q3t if q3t != "—" else (q2t if q2t != "—" else q1t)
+        # Сравниваем с поулом (P1 Q3)
+        pole   = next((r for r in q3 if r["position"]=="1"), None)
+        gap    = ""
+        if pole and q3t != "—" and pole["Q3"] != q3t:
+            gap = f"  · отставание от поула: <code>{pole['Q3']}</code>"
+
+        # Достиг ли Q3?
+        reached_q3 = bool(q3t and q3t != "—")
+        reached_q2 = bool(q2t and q2t != "—")
+
+        stage = "Q3 🟢" if reached_q3 else ("Q2 🟡" if reached_q2 else "Q1 🔴")
+
+        lines.append(f"\n\n🔴 <b>Шарль Леклер (Ferrari) — детальный разбор</b>")
+        lines.append(f"  📍 Стартовая позиция: <b>P{pos}</b>  ·  Дошёл до: <b>{stage}</b>")
+        lines.append(f"  ⏱ Q1: <code>{q1t}</code>  ·  Q2: <code>{q2t}</code>  ·  Q3: <code>{q3t}</code>")
+        lines.append(f"  🏆 Лучшее время: <code>{best_t}</code>{gap}")
+        if pos == 1:
+            lines.append("  🏁 <b>ПОУЛ-ПОЗИЦИЯ!</b> 🎉")
+        elif pos <= 3:
+            lines.append(f"  ✅ Отличная квалификация — топ-3")
+        elif pos <= 5:
+            lines.append(f"  👍 Хорошая позиция для гонки")
+        elif pos > 10:
+            lines.append(f"  ⚠️ Выбыл в {'Q1' if not reached_q2 else 'Q2'} — трудный старт гонки")
     return "\n".join(lines)
 
 async def fmt_race():
-    rname,results=await last_race()
+    rname,_,results=await last_race()
     if not results: return "❌ Результаты гонки недоступны — сезон ещё не начался"
     stds=await driver_standings(); pm={s["Driver"]["driverId"]:s["points"] for s in stds}
-    lines=[f"🏁 <b>Гонка — {rname}</b>\n"]; medals=["🥇","🥈","🥉"]
+    # Квалификационная позиция для Леклера
+    _, _, qresults = await last_quali()
+    qpos = {r["Driver"]["driverId"]: int(r["position"]) for r in qresults} if qresults else {}
+
+    medals = {1:"🥇",2:"🥈",3:"🥉"}
+    lines = [f"🏁 <b>Гонка — {rname}</b>\n"]
+
+    # Подиум
     lines.append("<b>Подиум:</b>")
     for r in results[:3]:
-        d=r["Driver"]
-        lines.append(f"  {medals[int(r['position'])-1]} <b>{d['givenName']} {d['familyName']}</b> ({r['Constructor']['name']}) +{r.get('points','0')} очк.")
+        d   = r["Driver"]
+        pos = int(r["position"])
+        drv = fmt_driver_jolpica(d, r["Constructor"]["name"])
+        lines.append(f"  {medals[pos]} {drv} +{r.get('points','0')} очк.")
+
+    # Топ-10
     lines.append("\n<b>Итоговая таблица (топ-10):</b>")
     for r in results[:10]:
-        d=r["Driver"]; total=pm.get(d["driverId"],"—")
-        lines.append(f"  {r['position']}. <b>{d['givenName'][0]}. {d['familyName']}</b> ({r['Constructor']['name']}) +{r.get('points','0')} → {total} очк.")
+        d     = r["Driver"]
+        pos   = int(r["position"])
+        total = pm.get(d["driverId"],"—")
+        drv   = fmt_driver_jolpica(d, r["Constructor"]["name"])
+        lines.append(f"  {pos:>2}. {drv} +{r.get('points','0')} → {total} очк.")
+
+    # Следующий уикенд
     wks=build_weekends(); now=datetime.now(tz=pytz.utc)
     nxt=next((w for w in wks if w["end_utc"]>now),None)
     if nxt:
         rs=next((s for s in nxt["sessions"] if "гонка" in s["summary"].lower()),None)
-        if rs: lines.append(f"\n📍 Следующая гонка: {nxt['flag']} <b>{nxt['gp_name']}</b>"); lines.append(f"  🕐 {dtstr(rs['start_utc'])}")
-    for r in results:
-        if r["Driver"]["familyName"]=="Leclerc":
-            d=r["Driver"]; total=pm.get(d["driverId"],"—")
-            lines.append(f"\n\n🔴 <b>Шарль Леклер — Scuderia Ferrari</b>")
-            lines.append(f"  Финиш: P{r['position']}")
-            lines.append(f"  Очки гонки: +{r.get('points','0')}")
-            lines.append(f"  Итого в сезоне: {total} очк.")
-            st=r.get("status","")
-            if st and st!="Finished": lines.append(f"  ⚠️ Статус: {st}")
-            if r.get("FastestLap"):
-                fl=r["FastestLap"]; lines.append(f"  ⚡ Быстрый круг: {fl['Time']['time']} (круг {fl['lap']})")
+        if rs:
+            lines.append(f"\n📍 Следующая гонка: {nxt['flag']} <b>{nxt['gp_name']}</b>")
+            lines.append(f"  🕐 {dtstr(rs['start_utc'])}")
+
+    # ── Детальная аналитика Леклера ──────────────────────────────────────────
+    lec = next((r for r in results if r["Driver"]["familyName"]=="Leclerc"), None)
+    if lec:
+        d      = lec["Driver"]
+        pos    = int(lec["position"])
+        pts    = lec.get("points","0")
+        total  = pm.get(d["driverId"],"—")
+        status = lec.get("status","Finished")
+        laps   = int(lec.get("laps","0") or 0)
+        grid   = int(lec.get("grid","0") or 0)   # стартовая позиция
+        q_pos  = qpos.get(d["driverId"], grid)    # позиция квали
+
+        # Быстрый круг
+        fl_data = lec.get("FastestLap")
+        fl_str  = ""
+        fl_rank = ""
+        if fl_data:
+            fl_str  = fl_data.get("Time",{}).get("time","")
+            fl_rank = fl_data.get("rank","")
+
+        # Изменение позиций: квали → финиш
+        if q_pos and pos:
+            delta = q_pos - pos   # положительное = поднялся
+            if delta > 0:
+                pos_change = f"+{delta} ↑ ({q_pos}→{pos})"
+            elif delta < 0:
+                pos_change = f"{delta} ↓ ({q_pos}→{pos})"
+            else:
+                pos_change = f"без изменений (P{pos})"
+        else:
+            pos_change = f"P{pos}"
+
+        # Финишировал или нет
+        dnf = status not in ("Finished", "+1 Lap", "+2 Laps", "+3 Laps")
+
+        # Победитель
+        winner = results[0]
+        gap_to_win = lec.get("Time",{}).get("time","") if pos > 1 else ""
+
+        lines.append(f"\n\n🔴 <b>Шарль Леклер (Ferrari) — детальный разбор</b>")
+        lines.append(f"")
+
+        # Старт и финиш
+        if grid:
+            lines.append(f"  🏁 Стартовал с: <b>P{grid}</b> (квали: P{q_pos})")
+        lines.append(f"  🏆 Финишировал: <b>P{pos}</b>  ·  Изменение: {pos_change}")
+
+        if dnf:
+            lines.append(f"  ❌ <b>Сход!</b> Причина: {status}  ·  Пройдено кругов: {laps}")
+        else:
+            lines.append(f"  ✅ Финишировал штатно  ·  Кругов: {laps}")
+            if gap_to_win:
+                w_d = winner["Driver"]
+                lines.append(f"  📏 Отставание от победителя ({w_d['familyName']}): +{gap_to_win}")
+
+        # Очки
+        lines.append(f"  💎 Очков за гонку: <b>+{pts}</b>  ·  Итого в сезоне: <b>{total}</b>")
+
+        # Быстрый круг
+        if fl_str:
+            is_fastest = str(fl_rank) == "1"
+            fl_icon = "⚡" if is_fastest else "🕐"
+            extra = " — <b>БЫСТРЕЙШИЙ КРУГ!</b>" if is_fastest else f" (ранг {fl_rank})"
+            lines.append(f"  {fl_icon} Лучший круг: <code>{fl_str}</code>{extra}")
+
+        # Оценка выступления
+        lines.append("")
+        if dnf:
+            lines.append(f"  📊 <i>Сход не позволил бороться — важно посмотреть на темп до схода</i>")
+        elif pos == 1:
+            lines.append(f"  📊 <i>Победа! Идеальный уикенд для Шарля и Ferrari 🎉</i>")
+        elif pos <= 3:
+            lines.append(f"  📊 <i>Подиум — сильное выступление</i>")
+        elif pos <= 6:
+            if delta := (q_pos - pos):
+                if delta > 0: lines.append(f"  📊 <i>Хорошая гонка — отыграл {delta} позиций</i>")
+                else: lines.append(f"  📊 <i>Потерял {-delta} позиций по ходу гонки</i>")
+            else:
+                lines.append(f"  📊 <i>Ровная гонка — удержал стартовую позицию</i>")
+        else:
+            lines.append(f"  📊 <i>Тяжёлый уикенд для Ferrari</i>")
+
     return "\n".join(lines)
 
 async def fmt_cur_weekend_with_results(w: dict) -> tuple:
@@ -746,9 +890,9 @@ async def fmt_cur_weekend_with_results(w: dict) -> tuple:
         lines.append("\n\n🏆 <b>Чемпионат гонщиков 2026</b>")
         for s in stds[:10]:
             d    = s["Driver"]
-            name = f"{d['givenName'][0]}. {d['familyName']}"
-            team = (s.get("Constructors") or [{}])[0].get("name", "—")
-            lines.append(f"  {s['position']}. <b>{name}</b> ({team}) · {s['points']} очк.")
+            team = (s.get("Constructors") or [{}])[0].get("name","—")
+            drv  = fmt_driver_jolpica(d, team)
+            lines.append(f"  {int(s['position']):>2}. {drv} · {s['points']} очк.")
     return "\n".join(lines)
 
 async def fmt_past_weekend(w: dict, rnd: int) -> str:
@@ -763,37 +907,31 @@ async def fmt_past_weekend(w: dict, rnd: int) -> str:
         "",
     ]
 
+    medals = {1:"🥇",2:"🥈",3:"🥉"}
     if results:
-        medals = ["🥇","🥈","🥉"]
         lines.append("<b>Подиум:</b>")
         for r in results[:3]:
-            d    = r["Driver"]
-            name = f"{d['givenName']} {d['familyName']}"
-            demoji = driver_emoji(d["familyName"])
-            lines.append(
-                f"  {medals[int(r['position'])-1]} {demoji} <b>{name}</b>"
-                f" ({r['Constructor']['name']}) +{r.get('points','0')} очк."
-            )
+            d   = r["Driver"]
+            pos = int(r["position"])
+            drv = fmt_driver_jolpica(d, r["Constructor"]["name"])
+            lines.append(f"  {medals[pos]} {drv} +{r.get('points','0')} очк.")
         lines.append("")
         lines.append("<b>Топ-10:</b>")
         for r in results[:10]:
             d     = r["Driver"]
             total = pts_map.get(d["driverId"], "—")
-            demoji = driver_emoji(d["familyName"])
-            lines.append(
-                f"  {r['position']}. {demoji} {d['givenName'][0]}. {d['familyName']}"
-                f" ({r['Constructor']['name']}) +{r.get('points','0')} → {total} очк."
-            )
+            pos   = int(r["position"])
+            drv   = fmt_driver_jolpica(d, r["Constructor"]["name"])
+            lines.append(f"  {pos:>2}. {drv} +{r.get('points','0')} → {total} очк.")
     else:
         lines.append("📭 Результаты гонки ещё не опубликованы")
 
     if stds:
         lines.append("\n🏆 <b>Чемпионат после этапа:</b>")
         for s in stds[:5]:
-            d    = s["Driver"]
-            name = f"{d['givenName'][0]}. {d['familyName']}"
-            demoji = driver_emoji(d["familyName"])
-            lines.append(f"  {s['position']}. {demoji} <b>{name}</b> — {s['points']} очк.")
+            d   = s["Driver"]
+            drv = fmt_driver_jolpica(d)
+            lines.append(f"  {s['position']}. {drv} — {s['points']} очк.")
 
     return "\n".join(lines)
 
@@ -814,22 +952,21 @@ async def fmt_past_quali(w: dict, rnd: int) -> str:
     if q3:
         lines.append("✅ <b>Q3:</b>")
         for r in q3:
-            d = r["Driver"]
-            demoji = driver_emoji(d["familyName"])
-            lines.append(f"  {r['position']}. {demoji} <b>{d['givenName'][0]}. {d['familyName']}</b>"
-                         f" ({r['Constructor']['name']})  <code>{r['Q3']}</code>")
+            d   = r["Driver"]
+            drv = fmt_driver_jolpica(d, r["Constructor"]["name"])
+            lines.append(f"  {r['position']:>2}. {drv}  <code>{r['Q3']}</code>")
     if q2:
         lines.append("\n⚠️ <b>Выбыли в Q2:</b>")
         for r in q2:
-            d = r["Driver"]
-            demoji = driver_emoji(d["familyName"])
-            lines.append(f"  {r['position']}. {demoji} {d['givenName'][0]}. {d['familyName']}  <code>{r['Q2']}</code>")
+            d   = r["Driver"]
+            drv = fmt_driver_jolpica(d, r["Constructor"]["name"], bold=False)
+            lines.append(f"  {r['position']:>2}. {drv}  <code>{r['Q2']}</code>")
     if q1:
         lines.append("\n❌ <b>Выбыли в Q1:</b>")
         for r in q1:
-            d = r["Driver"]
-            demoji = driver_emoji(d["familyName"])
-            lines.append(f"  {r['position']}. {demoji} {d['givenName'][0]}. {d['familyName']}  <code>{r.get('Q1','—')}</code>")
+            d   = r["Driver"]
+            drv = fmt_driver_jolpica(d, r["Constructor"]["name"], bold=False)
+            lines.append(f"  {r['position']:>2}. {drv}  <code>{r.get('Q1','—')}</code>")
     return "\n".join(lines)
 
 # ── LIVE MONITOR ──────────────────────────────────────────────────────────────
@@ -1086,7 +1223,7 @@ class LiveMonitor:
         # Шаг 2: ждём Jolpica (проверяем каждые 10 мин, до 1 часа)
         for attempt in range(6):
             await asyncio.sleep(600)
-            rname, results = await last_race()
+            rname, _, results = await last_race()
             if results:
                 stds = await driver_standings()
                 pts  = {s["Driver"]["driverId"]: s["points"] for s in stds}
@@ -1098,10 +1235,8 @@ class LiveMonitor:
                     pos  = int(r["position"])
                     medal = medals.get(pos, f"{pos}.")
                     total = pts.get(d["driverId"], "—")
-                    lines.append(
-                        f"  {medal} {flag} {d['givenName'][0]}. {last}"
-                        f" ({r['Constructor']['name']}) +{r.get('points','0')} → {total} очк."
-                    )
+                    drv = fmt_driver_jolpica(d, r["Constructor"]["name"])
+                lines.append(f"  {medal} {drv} +{r.get('points','0')} → {total} очк.")
                 await self._bcast("\n".join(lines))
                 log.info("Официальные результаты отправлены после %d мин", (attempt+1)*10)
                 return
@@ -1109,6 +1244,9 @@ class LiveMonitor:
 
 
 _monitor: Optional[LiveMonitor] = None
+
+# Активные фоновые задачи загрузки: message_id → Task
+_loading_tasks: dict[int, asyncio.Task] = {}
 
 async def find_openf1_session(gp_name: str, sess_type: str) -> Optional[dict]:
     """
@@ -1188,15 +1326,13 @@ async def send_reminder(ev,mins):
     wdata=await get_weather(city, target_dt=ev["start_utc"])
     lines.append(fmt_weather_block(wdata, target_dt=ev["start_utc"]))
     if "гонка" in ev["summary"].lower() and mins >= 0:
-        _,qr=await last_quali()
+        _,_,qr=await last_quali()
         if qr:
             lines.append("\n🏁 <b>Стартовая решётка:</b>")
             for q in qr:
-                d    = q["Driver"]
-                last = d["familyName"]
-                flag = driver_emoji(last)
-                team = q["Constructor"]["name"]
-                lines.append(f"  <b>P{q['position']}</b>  {flag} {d['givenName'][0]}. {last}  ({team})")
+                d   = q["Driver"]
+                drv = fmt_driver_jolpica(d, q["Constructor"]["name"])
+                lines.append(f"  <b>P{q['position']}</b>  {drv}")
     text="\n".join(lines)
     await broadcast(text)
 
@@ -1229,6 +1365,49 @@ def schedule_all():
                                   id=f"live_{s['summary']}_{start.isoformat()}",replace_existing=True)
     log.info("Запланировано %d напоминаний, %d уикендов",count,len(wks))
 
+# ── LOADING TASK MANAGER ─────────────────────────────────────────────────────
+def cancel_kb(msg_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✖️ Отмена", callback_data=f"cancel:{msg_id}")]
+    ])
+
+async def run_with_cancel(q, loading_text: str, coro, reply_kb_fn=None):
+    """
+    Показывает «загружаю + кнопка Отмена», запускает coro как Task.
+    Если задача завершилась — показывает результат.
+    Если отменена — ничего (on_cb уже показал меню).
+    reply_kb_fn: async callable() → InlineKeyboardMarkup
+    """
+    msg_id = q.message.message_id
+    # Показываем кнопку отмены
+    await q.edit_message_text(
+        f"⏳ {loading_text}",
+        parse_mode="HTML",
+        reply_markup=cancel_kb(msg_id)
+    )
+
+    async def _work():
+        try:
+            text = await coro
+            kb   = (await reply_kb_fn()) if reply_kb_fn else back_kb()
+            await q.edit_message_text(text[:4090], parse_mode="HTML", reply_markup=kb)
+        except asyncio.CancelledError:
+            pass  # отменено пользователем — on_cb уже отрисовал меню
+        except Exception as e:
+            log.error("run_with_cancel coro: %s", e)
+            try:
+                await q.edit_message_text(
+                    "⚠️ Не удалось загрузить данные. Попробуй ещё раз.",
+                    reply_markup=back_kb()
+                )
+            except Exception:
+                pass
+        finally:
+            _loading_tasks.pop(msg_id, None)
+
+    task = asyncio.ensure_future(_work())
+    _loading_tasks[msg_id] = task
+
 # ── KEYBOARDS ─────────────────────────────────────────────────────────────────
 REPLY_KB=ReplyKeyboardMarkup([["🏠 Меню"]],resize_keyboard=True,is_persistent=True)
 def _home(): return [InlineKeyboardButton("🏠 Меню",callback_data="home")]
@@ -1255,22 +1434,25 @@ def main_kb(cid, priv):
 
 async def cur_weekend_kb(w: dict = None):
     """Кнопки текущего уикенда с индикатором наличия результатов.
-    w — уикенд для которого показываем кнопки; галочки проверяются по нему."""
-    qname, qr = await last_quali()
-    rname, rr = await last_race()
+    Сравниваем по дате: результат «свежий» если дата из Jolpica
+    попадает в окно уикенда (start_utc-1д … end_utc+2д)."""
+    _, qdate, qr = await last_quali()
+    _, rdate, rr = await last_race()
 
-    # Проверяем что результаты относятся к этому уикенду (по названию ГП)
-    gp = (w.get("gp_name") or "").lower() if w else ""
-    def _matches(name: str) -> bool:
-        if not gp or not name: return False
-        # Jolpica возвращает "Australian Grand Prix" — сравниваем ключевое слово
-        nl = name.lower()
-        # Берём первое слово из gp_name и ищем его в rname
-        keyword = gp.split()[0]
-        return keyword in nl
+    def _result_belongs(date_str: str) -> bool:
+        """date_str — 'YYYY-MM-DD' из Jolpica."""
+        if not w or not date_str:
+            return bool(qr or rr)   # нет уикенда — показываем если есть хоть что-то
+        try:
+            result_dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=pytz.utc)
+            w_start   = w["start_utc"] - timedelta(days=1)
+            w_end     = w["end_utc"]   + timedelta(days=2)
+            return w_start <= result_dt <= w_end
+        except Exception:
+            return False
 
-    q_dot = "🟢" if (qr and _matches(qname)) else "⚫️"
-    r_dot = "🟢" if (rr and _matches(rname)) else "⚫️"
+    q_dot = "🟢" if (qr and _result_belongs(qdate)) else "⚫️"
+    r_dot = "🟢" if (rr and _result_belongs(rdate)) else "⚫️"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"🔥 Квалификация — результаты {q_dot}", callback_data="res:quali")],
         [InlineKeyboardButton(f"🏁 Гонка — результаты {r_dot}",        callback_data="res:race")],
@@ -1405,6 +1587,18 @@ async def on_cb(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except: await q.edit_message_reply_markup(reply_markup=None)
         return
 
+    # ── Отмена загрузки ───────────────────────────────────────────────────────
+    if data.startswith("cancel:"):
+        msg_id = int(data.split(":")[1])
+        task = _loading_tasks.pop(msg_id, None)
+        if task and not task.done():
+            task.cancel()
+        await q.edit_message_text(
+            "🏎️ <b>F1 2026 — главное меню</b>",
+            parse_mode="HTML", reply_markup=main_kb(chat.id, priv)
+        )
+        return
+
     # ── Главное меню ──────────────────────────────────────────────────────────
     if data == "home":
         await q.edit_message_text(
@@ -1423,18 +1617,16 @@ async def on_cb(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s = nxt_session(build_weekends())
         if not s:
             await q.edit_message_text("😔 Нет предстоящих событий.", reply_markup=back_kb()); return
-        await q.edit_message_text("⏳ Загружаю погоду...", parse_mode="HTML")
-        text = await fmt_next_sess(s)
-        await q.edit_message_text(text[:4090], parse_mode="HTML", reply_markup=back_kb()); return
+        await run_with_cancel(q, "Загружаю погоду...", fmt_next_sess(s)); return
 
     # ── Этот уикенд (с кнопками результатов) ─────────────────────────────────
     if data == "cal:current":
         wks = build_weekends(); w = cur_weekend(wks) or nxt_weekend(wks)
         if not w:
             await q.edit_message_text("😔 Нет данных.", reply_markup=back_kb()); return
-        await q.edit_message_text("⏳ Загружаю...", parse_mode="HTML")
-        text = await fmt_cur_weekend_with_results(w)
-        await q.edit_message_text(text[:4090], parse_mode="HTML", reply_markup=await cur_weekend_kb(w)); return
+        _w = w
+        await run_with_cancel(q, "Загружаю...", fmt_cur_weekend_with_results(_w),
+                              reply_kb_fn=lambda: cur_weekend_kb(_w)); return
 
     # ── Следующий уикенд ──────────────────────────────────────────────────────
     if data == "cal:next":
@@ -1473,12 +1665,9 @@ async def on_cb(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
         w    = _round_for_past(past, rnd)
         if not w:
             await q.edit_message_text("😔 Уикенд не найден.", reply_markup=back_kb()); return
-        await q.edit_message_text("⏳ Загружаю результаты...", parse_mode="HTML")
-        text = await fmt_past_weekend(w, rnd)
-        await q.edit_message_text(
-            text[:4090], parse_mode="HTML",
-            reply_markup=await past_weekend_detail_kb(rnd)
-        ); return
+        _rnd = rnd
+        await run_with_cancel(q, "Загружаю результаты...", fmt_past_weekend(w, _rnd),
+                              reply_kb_fn=lambda: past_weekend_detail_kb(_rnd)); return
 
     if data.startswith("cal:past_quali:"):
         rnd  = int(data.split(":")[-1])
@@ -1486,34 +1675,24 @@ async def on_cb(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
         w    = _round_for_past(past, rnd)
         if not w:
             await q.edit_message_text("😔 Уикенд не найден.", reply_markup=back_kb()); return
-        await q.edit_message_text("⏳ Загружаю квалификацию...", parse_mode="HTML")
-        text = await fmt_past_quali(w, rnd)
-        await q.edit_message_text(
-            text[:4090], parse_mode="HTML",
-            reply_markup=await past_weekend_detail_kb(rnd)
-        ); return
+        _rnd = rnd
+        await run_with_cancel(q, "Загружаю квалификацию...", fmt_past_quali(w, _rnd),
+                              reply_kb_fn=lambda: past_weekend_detail_kb(_rnd)); return
 
     # ── Чемпионат ─────────────────────────────────────────────────────────────
     if data == "res:standings":
-        await q.edit_message_text("⏳ Загружаю...", parse_mode="HTML")
-        await q.edit_message_text(
-            (await fmt_standings())[:4090], parse_mode="HTML", reply_markup=back_kb()
-        ); return
+        await run_with_cancel(q, "Загружаю баллы за сезон...", fmt_standings()); return
 
     # ── Результаты (квали/гонка) — из текущего уикенда ───────────────────────
     if data == "res:quali":
-        await q.edit_message_text("⏳ Загружаю...", parse_mode="HTML")
         wks = build_weekends(); cw = cur_weekend(wks) or nxt_weekend(wks)
-        await q.edit_message_text(
-            (await fmt_quali())[:4090], parse_mode="HTML", reply_markup=await cur_weekend_kb(cw)
-        ); return
+        await run_with_cancel(q, "Загружаю результаты квалификации...", fmt_quali(),
+                              reply_kb_fn=lambda: cur_weekend_kb(cw)); return
 
     if data == "res:race":
-        await q.edit_message_text("⏳ Загружаю...", parse_mode="HTML")
         wks = build_weekends(); cw = cur_weekend(wks) or nxt_weekend(wks)
-        await q.edit_message_text(
-            (await fmt_race())[:4090], parse_mode="HTML", reply_markup=await cur_weekend_kb(cw)
-        ); return
+        await run_with_cancel(q, "Загружаю результаты гонки...", fmt_race(),
+                              reply_kb_fn=lambda: cur_weekend_kb(cw)); return
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 async def post_init(app:Application):
