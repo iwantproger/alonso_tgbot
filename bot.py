@@ -570,16 +570,35 @@ def driver_emoji(last_name: str) -> str:
     return _DRIVER_FLAG.get(last_name, "🏁")
 
 def fmt_driver(first: str, last: str, team: str = "", bold: bool = True) -> str:
-    """Единый формат гонщика: 🇲🇨 <b>Charles Leclerc</b> (Ferrari)"""
-    flag  = driver_emoji(last)
-    name  = f"{first} {last}".strip()
+    """Единый формат: 🇲🇨 <b>Charles Leclerc</b> (Ferrari)"""
+    flag   = driver_emoji(last)
+    name   = f"{first} {last}".strip()
     name_s = f"<b>{name}</b>" if bold else name
     team_s = f" ({team})" if team else ""
     return f"{flag} {name_s}{team_s}"
 
 def fmt_driver_jolpica(d: dict, team: str = "", bold: bool = True) -> str:
-    """Форматирует гонщика из Jolpica dict с ключами givenName/familyName."""
+    """Форматирует гонщика из Jolpica dict."""
     return fmt_driver(d.get("givenName",""), d.get("familyName",""), team, bold)
+
+def fmt_result_row(pos: int | str, d: dict, team: str,
+                   time_or_gap: str = "", points: str = "",
+                   total_pts: str = "", bold: bool = True) -> str:
+    """
+    Чистая двухстрочная строка результата:
+      3. 🇲🇨 Charles Leclerc (Ferrari)
+         ⏱ +4.123  ·  +15 очк.  →  43 всего
+    """
+    drv   = fmt_driver_jolpica(d, team, bold=bold)
+    stats = []
+    if time_or_gap: stats.append(f"⏱ {time_or_gap}")
+    if points not in ("","0","0.0"): stats.append(f"+{points} очк.")
+    if total_pts:   stats.append(f"→ {total_pts} всего")
+    stat_line = "  " + "  ·  ".join(stats) if stats else ""
+    row = f"  {pos}. {drv}"
+    if stats:
+        row += "\n" + "     " + "  ·  ".join(stats)
+    return row
 
 
 # ── FORMATTERS ────────────────────────────────────────────────────────────────
@@ -698,7 +717,11 @@ async def fmt_standings():
         d    = s["Driver"]
         team = (s.get("Constructors") or [{}])[0].get("name","—")
         drv  = fmt_driver_jolpica(d, team)
-        lines.append(f"  {int(s['position']):>2}. {drv} — {s['points']} очк.")
+        pos  = int(s["position"])
+        wins = s.get("wins","0")
+        w_str = f"  ·  {wins} побед" if wins and wins != "0" else ""
+        lines.append(f"  {pos:>2}. {drv}")
+        lines.append(f"       {s['points']} очк.{w_str}")
     return "\n".join(lines)
 
 async def fmt_quali():
@@ -786,8 +809,19 @@ async def fmt_race():
         d     = r["Driver"]
         pos   = int(r["position"])
         total = pm.get(d["driverId"],"—")
-        drv   = fmt_driver_jolpica(d, r["Constructor"]["name"])
-        lines.append(f"  {pos:>2}. {drv} +{r.get('points','0')} → {total} очк.")
+        # Время/отставание
+        t_raw = r.get("Time",{}).get("time","") if pos > 1 else "победитель"
+        status = r.get("status","Finished")
+        if status not in ("Finished","+1 Lap","+2 Laps","+3 Laps") and pos > 1:
+            gap = f"Сход ({status})"
+        elif pos == 1:
+            gap = t_raw or "победитель"
+        else:
+            gap = f"+{t_raw}" if t_raw else ""
+        lines.append(fmt_result_row(pos, d, r["Constructor"]["name"],
+                                    time_or_gap=gap,
+                                    points=r.get("points","0"),
+                                    total_pts=str(total)))
 
     # Следующий уикенд
     wks=build_weekends(); now=datetime.now(tz=pytz.utc)
@@ -921,8 +955,18 @@ async def fmt_past_weekend(w: dict, rnd: int) -> str:
             d     = r["Driver"]
             total = pts_map.get(d["driverId"], "—")
             pos   = int(r["position"])
-            drv   = fmt_driver_jolpica(d, r["Constructor"]["name"])
-            lines.append(f"  {pos:>2}. {drv} +{r.get('points','0')} → {total} очк.")
+            t_raw = r.get("Time",{}).get("time","") if pos > 1 else "победитель"
+            status = r.get("status","Finished")
+            if status not in ("Finished","+1 Lap","+2 Laps","+3 Laps") and pos > 1:
+                gap = f"Сход ({status})"
+            elif pos == 1:
+                gap = t_raw or "победитель"
+            else:
+                gap = f"+{t_raw}" if t_raw else ""
+            lines.append(fmt_result_row(pos, d, r["Constructor"]["name"],
+                                        time_or_gap=gap,
+                                        points=r.get("points","0"),
+                                        total_pts=str(total)))
     else:
         lines.append("📭 Результаты гонки ещё не опубликованы")
 
@@ -1500,10 +1544,20 @@ def past_weekends_kb(wks):
     return InlineKeyboardMarkup(rows)
 
 async def past_weekend_detail_kb(rnd: int):
+    """Клавиатура страницы результатов гонки прошедшего уикенда."""
     _, qr = await quali_by_round(2026, rnd)
     q_dot = "🟢" if qr else "⚫️"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"🔥 Квалификация — результаты {q_dot}", callback_data=f"cal:past_quali:{rnd}")],
+        [InlineKeyboardButton("◀️ Все прошедшие уикенды", callback_data="cal:past")],
+        _home(),
+    ])
+
+def past_quali_kb(rnd: int):
+    """Клавиатура страницы квалификации прошедшего уикенда."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("◀️ Результаты гонки",        callback_data=f"cal:past:{rnd}")],
+        [InlineKeyboardButton("◀️ Все прошедшие уикенды",   callback_data="cal:past")],
         _home(),
     ])
 
@@ -1676,8 +1730,9 @@ async def on_cb(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not w:
             await q.edit_message_text("😔 Уикенд не найден.", reply_markup=back_kb()); return
         _rnd = rnd
+        async def _pq_kb(): return past_quali_kb(_rnd)
         await run_with_cancel(q, "Загружаю квалификацию...", fmt_past_quali(w, _rnd),
-                              reply_kb_fn=lambda: past_weekend_detail_kb(_rnd)); return
+                              reply_kb_fn=_pq_kb); return
 
     # ── Чемпионат ─────────────────────────────────────────────────────────────
     if data == "res:standings":
