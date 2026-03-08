@@ -42,6 +42,53 @@ def subscribe(cid, priv):
 def active_subs():
     d=_load(); muted=set(d.get("muted",[])); return [c for c in d["users"]+d["chats"] if c not in muted]
 
+async def broadcast(text: str, parse_mode: str = "HTML"):
+    """Рассылка всем подписчикам с обработкой ошибок и автоочисткой мёртвых чатов."""
+    if not _app:
+        return
+    dead = []
+    migrated = []   # (old_id, new_id)
+    for cid in active_subs():
+        try:
+            await _app.bot.send_message(cid, text, parse_mode=parse_mode)
+        except Exception as e:
+            err = str(e)
+            if "ChatMigrated" in err or "chat_id_invalid" in err.lower():
+                # Группа стала супергруппой — пробуем найти новый ID из ошибки
+                import re as _re
+                m = _re.search(r"migrate_to_chat_id.*?(-[0-9]+)", err)
+                new_id = int(m.group(1)) if m else None
+                if new_id:
+                    migrated.append((cid, new_id))
+                    try:
+                        await _app.bot.send_message(new_id, text, parse_mode=parse_mode)
+                        log.info("ChatMigrated: %s → %s, обновляем", cid, new_id)
+                    except Exception as e2:
+                        log.warning("После миграции %s: %s", new_id, e2)
+                else:
+                    dead.append(cid)
+            elif any(x in err for x in ["Forbidden", "bot was kicked", "user is deactivated",
+                                         "chat not found", "blocked"]):
+                dead.append(cid)
+                log.info("Мёртвый чат убран: %s (%s)", cid, err[:60])
+            else:
+                log.warning("Broadcast→%s: %s", cid, err)
+
+    # Обновляем storage
+    if dead or migrated:
+        d = _load()
+        for cid in dead:
+            for key in ("users", "chats", "muted"):
+                if cid in d.get(key, []): d[key].remove(cid)
+        for old_id, new_id in migrated:
+            for key in ("users", "chats"):
+                if old_id in d.get(key, []):
+                    d[key].remove(old_id)
+                    if new_id not in d[key]: d[key].append(new_id)
+            if old_id in d.get("muted", []):
+                d["muted"].remove(old_id)
+        _save(d)
+
 # ── FLAGS ─────────────────────────────────────────────────────────────────────
 _FL = {"саудовской аравии":"🇸🇦","великобритании":"🇬🇧","барселоны-каталонии":"🇪🇸",
        "сан-паулу":"🇧🇷","лас-вегаса":"🇺🇸","абу-даби":"🇦🇪","австралии":"🇦🇺",
@@ -101,10 +148,25 @@ def build_weekends():
     for w in wknds: w["start_utc"]=w["sessions"][0]["start_utc"]; w["end_utc"]=w["sessions"][-1]["start_utc"]
     wknds.sort(key=lambda w:w["start_utc"]); return wknds
 
+def _weekend_end_msk(w) -> datetime:
+    """Уикенд считается «текущим» до понедельника 06:00 МСК после гонки."""
+    race_start = w["end_utc"]   # end_utc = старт последней сессии (гонки)
+    race_end   = race_start + timedelta(hours=4)   # гонка ~2ч + запас
+    # Переводим в МСК, находим ближайший пн 06:00
+    msk_end = race_end.astimezone(MSK)
+    days_to_mon = (7 - msk_end.weekday()) % 7   # 0 если уже пн
+    if days_to_mon == 0 and msk_end.hour >= 6:
+        days_to_mon = 7
+    mon_0600 = msk_end.replace(hour=6, minute=0, second=0, microsecond=0) + timedelta(days=days_to_mon)
+    return mon_0600.astimezone(pytz.utc)
+
 def cur_weekend(wks):
-    now=datetime.now(tz=pytz.utc)
+    now = datetime.now(tz=pytz.utc)
     for w in wks:
-        if w["start_utc"]-timedelta(hours=6)<=now<=w["end_utc"]+timedelta(hours=4): return w
+        window_start = w["start_utc"] - timedelta(hours=6)
+        window_end   = _weekend_end_msk(w)
+        if window_start <= now <= window_end:
+            return w
     return None
 def nxt_weekend(wks):
     now=datetime.now(tz=pytz.utc)
@@ -368,20 +430,120 @@ async def quali_by_round(season: int, rnd: int):
     if not races: return "",[]
     return races[0].get("raceName",""),races[0].get("QualifyingResults",[])
 
-# ── OPENF1 API ────────────────────────────────────────────────────────────────
-O="https://api.openf1.org/v1"
-async def oget(path):
+# ── API LAYER: OpenF1 + F1LiveTiming (параллельно) ───────────────────────────
+O  = "https://api.openf1.org/v1"
+MV = "https://api.multiviewer.app/api/v1"
+
+_TIMEOUT_FAST = aiohttp.ClientTimeout(total=5)
+_TIMEOUT_SLOW = aiohttp.ClientTimeout(total=10)
+
+async def _get_json(url: str, timeout=None) -> list | dict | None:
+    """Быстрый GET с таймаутом, возвращает None при ошибке."""
     try:
-        async with http.get(f"{O}{path}",timeout=aiohttp.ClientTimeout(total=6)) as r:
-            return await r.json(content_type=None)
-    except: return []
+        async with http.get(url, timeout=timeout or _TIMEOUT_FAST) as r:
+            if r.status == 200:
+                return await r.json(content_type=None)
+    except Exception as e:
+        log.debug("GET %s: %s", url, e)
+    return None
+
+async def oget(path) -> list:
+    """OpenF1 GET → всегда список."""
+    result = await _get_json(f"{O}{path}")
+    if isinstance(result, list): return result
+    return []
+
+async def mvget(path) -> dict | None:
+    """Multiviewer GET → dict или None."""
+    return await _get_json(f"{MV}{path}")
+
+# ── Параллельный fetch с race-condition: берём первый непустой ответ ──────────
+async def _parallel_first(*coros):
+    """Запускает корутины параллельно, возвращает первый непустой результат."""
+    tasks = [asyncio.ensure_future(c) for c in coros]
+    result = None
+    try:
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            val = task.result()
+            if val:
+                result = val
+                break
+        # если первый пустой — ждём остальных
+        if not result and pending:
+            done2, _ = await asyncio.wait(pending, timeout=4)
+            for task in done2:
+                val = task.result()
+                if val:
+                    result = val
+                    break
+    finally:
+        for t in tasks:
+            if not t.done(): t.cancel()
+    return result
 
 async def f1_latest_sess():
-    d=await oget("/sessions?session_key=latest"); return d[0] if d else None
-async def f1_drivers(sk): d=await oget(f"/drivers?session_key={sk}"); return {x["driver_number"]:x for x in d}
-async def f1_rc(sk): return await oget(f"/race_control?session_key={sk}")
-async def f1_pit(sk): return await oget(f"/pit?session_key={sk}")
-async def f1_laps(sk): return await oget(f"/laps?session_key={sk}")
+    d = await oget("/sessions?session_key=latest")
+    return d[0] if d else None
+
+async def f1_drivers(sk: int) -> dict:
+    d = await oget(f"/drivers?session_key={sk}")
+    return {x["driver_number"]: x for x in d}
+
+# ── Race Control: OpenF1 основной, Multiviewer запасной ──────────────────────
+async def _rc_openf1(sk: int) -> list:
+    return await oget(f"/race_control?session_key={sk}")
+
+async def _rc_multiviewer(year: int, session_path: str) -> list:
+    """
+    Multiviewer хранит Race Control в SessionInfo.
+    Возвращает список событий в формате совместимом с OpenF1.
+    """
+    data = await mvget(f"/session/{year}/{session_path}/RaceControlMessages")
+    if not data or not isinstance(data, dict):
+        return []
+    messages = data.get("Messages", {})
+    result = []
+    for key, m in messages.items():
+        if not isinstance(m, dict):
+            continue
+        result.append({
+            "date":    m.get("Utc", ""),
+            "message": m.get("Message", ""),
+            "flag":    m.get("Flag", ""),
+            "category":m.get("Category", ""),
+            "scope":   m.get("Scope", ""),
+        })
+    return result
+
+async def f1_rc(sk: int, mv_path: str = None, year: int = 2026) -> list:
+    """Параллельно тянет Race Control из OpenF1 и Multiviewer, мёржит."""
+    coros = [_rc_openf1(sk)]
+    if mv_path:
+        coros.append(_rc_multiviewer(year, mv_path))
+    results = await asyncio.gather(*coros, return_exceptions=True)
+
+    merged, seen_uid = [], set()
+    for batch in results:
+        if isinstance(batch, Exception) or not batch:
+            continue
+        for m in batch:
+            uid = f"{m.get('date','')}{m.get('message','')}"
+            if uid not in seen_uid:
+                seen_uid.add(uid)
+                merged.append(m)
+    return sorted(merged, key=lambda x: x.get("date", ""))
+
+async def f1_pit(sk: int) -> list:
+    return await oget(f"/pit?session_key={sk}")
+
+async def f1_laps(sk: int) -> list:
+    """Только круги с реальным временем (60–200 сек)."""
+    laps = await oget(f"/laps?session_key={sk}")
+    return [l for l in laps if l.get("lap_duration") and 60 < l["lap_duration"] < 200]
+
+async def f1_positions(sk: int) -> list:
+    return await oget(f"/position?session_key={sk}")
 
 # ── DRIVER COUNTRY FLAGS ─────────────────────────────────────────────────────
 _DRIVER_FLAG = {
@@ -672,233 +834,345 @@ async def fmt_past_quali(w: dict, rnd: int) -> str:
 
 # ── LIVE MONITOR ──────────────────────────────────────────────────────────────
 class LiveMonitor:
-    def __init__(self, sk, gp, city, sess_type="race"):
+    POLL_INTERVAL = 7   # сек между опросами
+
+    def __init__(self, sk: int, gp: str, city: str, sess_type: str = "race",
+                 mv_path: str = None, year: int = 2026):
         self.key       = sk
         self.gp        = gp
         self.city      = city
-        self.sess_type = sess_type   # "race" | "quali" | "practice"
+        self.sess_type = sess_type
+        self.mv_path   = mv_path   # путь для Multiviewer, например "1/Q"
+        self.year      = year
         self.running   = False
-        self.drivers: dict = {}
-        self.seen_rc:  set = set()   # uid уже виденных race_control событий
-        self.seen_pit: set = set()
-        self.best_lap: Optional[float] = None
-        # флаги чтобы не дублировать уникальные события
-        self.form_sent    = False
-        self.start_sent   = False
-        self.podium_sent: set = set()   # P1, P2, P3
+        self.drivers:      dict  = {}
+        self.seen_rc:      set   = set()
+        self.seen_pit:     set   = set()
+        self.best_lap:     Optional[float] = None
+        self.form_sent:    bool  = False
+        self.start_sent:   bool  = False
+        self.finish_sent:  bool  = False
+        self.podium_sent:  set   = set()
+        self._post_race_task = None
 
     # ── запуск ───────────────────────────────────────────────────────────────
     async def run(self):
         self.running = True
-        self.drivers = await f1_drivers(self.key)
         log.info("🔴 LiveMonitor start sk=%s  %s  type=%s", self.key, self.gp, self.sess_type)
 
-        # --- ВАЖНО: «проглатываем» всю историческую очередь без отправки ---
-        history = await f1_rc(self.key)
-        for m in history:
-            uid = f"{m.get('date','')}{m.get('message','')}"
-            self.seen_rc.add(uid)
-        hist_pits = await f1_pit(self.key)
+        # Параллельно грузим гонщиков + историю RC + питы + круги
+        (self.drivers,
+         history_rc,
+         hist_pits,
+         hist_laps) = await asyncio.gather(
+            f1_drivers(self.key),
+            f1_rc(self.key, self.mv_path, self.year),
+            f1_pit(self.key),
+            f1_laps(self.key),
+            return_exceptions=True
+        )
+        if isinstance(self.drivers, Exception): self.drivers = {}
+        if isinstance(history_rc,   Exception): history_rc   = []
+        if isinstance(hist_pits,    Exception): hist_pits    = []
+        if isinstance(hist_laps,    Exception): hist_laps    = []
+
+        # Глотаем историю — не отправляем
+        for m in history_rc:
+            self.seen_rc.add(f"{m.get('date','')}{m.get('message','')}")
         for p in hist_pits:
-            pid = f"{p.get('driver_number')}_{p.get('lap_number')}_{p.get('pit_duration')}"
-            self.seen_pit.add(pid)
-        # Лучший круг из истории (не отправляем, только запоминаем)
-        hist_laps = await f1_laps(self.key)
-        valid = [l for l in hist_laps if l.get("lap_duration") and l["lap_duration"] > 0]
-        if valid:
-            self.best_lap = min(l["lap_duration"] for l in valid)
-        log.info("История загружена: %d RC, %d pit, best_lap=%s", len(self.seen_rc), len(self.seen_pit), self.best_lap)
-        # ---------------------------------------------------------------------
+            self.seen_pit.add(f"{p.get('driver_number')}_{p.get('lap_number')}_{p.get('pit_duration')}")
+        valid_laps = [l for l in hist_laps if l.get("lap_duration","") and l["lap_duration"] > 0]
+        if valid_laps:
+            self.best_lap = min(l["lap_duration"] for l in valid_laps)
+
+        log.info("История: %d RC, %d pit, best=%.3fs, %d гонщиков",
+                 len(self.seen_rc), len(self.seen_pit),
+                 self.best_lap or 0, len(self.drivers))
 
         while self.running:
             try:
                 await self._poll()
             except Exception as e:
                 log.error("LiveMonitor poll: %s", e)
-            await asyncio.sleep(10)
+            await asyncio.sleep(self.POLL_INTERVAL)
 
     def stop(self):
         self.running = False
         log.info("LiveMonitor stopped — %s", self.gp)
 
     def _name(self, n) -> str:
-        return self.drivers.get(n, {}).get("full_name") or f"#{n}"
+        d = self.drivers.get(n, {})
+        return d.get("full_name") or d.get("broadcast_name") or f"#{n}"
     def _team(self, n) -> str:
         return self.drivers.get(n, {}).get("team_name") or ""
+    def _flag(self, n) -> str:
+        full = self._name(n)
+        last = full.split()[-1] if full else ""
+        return driver_emoji(last)
 
     async def _bcast(self, text: str):
-        if not _app: return
-        for cid in active_subs():
-            try:
-                await _app.bot.send_message(cid, text, parse_mode="HTML")
-            except Exception as e:
-                log.warning("Live→%s: %s", cid, e)
+        await broadcast(text)
 
     async def _poll(self):
-        await self._rc()
+        """Параллельный опрос всех источников."""
         if self.sess_type == "race":
-            await self._pitstop()
-            await self._fl()
-            await self._positions()
+            await asyncio.gather(
+                self._rc(),
+                self._pitstop(),
+                self._fl(),
+                self._positions(),
+                return_exceptions=True
+            )
         elif self.sess_type == "quali":
-            await self._fl()   # быстрые круги важны на квали
+            await asyncio.gather(
+                self._rc(),
+                self._fl(),
+                return_exceptions=True
+            )
+        else:  # practice
+            await self._rc()
 
-    # ── Race Control сообщения ───────────────────────────────────────────────
+    # ── Race Control ─────────────────────────────────────────────────────────
     async def _rc(self):
-        msgs = await f1_rc(self.key)
+        msgs = await f1_rc(self.key, self.mv_path, self.year)
         for m in msgs:
             uid = f"{m.get('date','')}{m.get('message','')}"
             if uid in self.seen_rc:
                 continue
             self.seen_rc.add(uid)
+            await self._handle_rc(m)
 
-            text = m.get("message", "")
-            flag = (m.get("flag") or "").upper()
-            cat  = (m.get("category") or "").upper()
-            up   = text.upper()
+    async def _handle_rc(self, m: dict):
+        text = m.get("message", "")
+        flag = (m.get("flag") or "").upper()
+        cat  = (m.get("category") or "").upper()
+        up   = text.upper()
 
-            # ── ПРОГРЕВОЧНЫЙ КРУГ ────────────────────────────────────────────
-            if ("FORMATION LAP" in up or "FORMATION" in up) and not self.form_sent:
-                self.form_sent = True
-                label = "Прогревочный круг" if self.sess_type == "race" else "Сессия начинается"
-                await self._bcast(f"🏎️ <b>{label}!</b>\n\n<b>{self.gp}</b>")
+        if ("FORMATION LAP" in up or "FORMATION" in up) and not self.form_sent:
+            self.form_sent = True
+            label = "Прогревочный круг" if self.sess_type == "race" else "Сессия начинается"
+            await self._bcast(f"🏎️ <b>{label}!</b>\n\n<b>{self.gp}</b>")
 
-            # ── СТАРТ ────────────────────────────────────────────────────────
-            elif flag == "GREEN" and not self.start_sent and self.sess_type == "race":
-                self.start_sent = True
-                w = await get_weather(self.city)
-                await self._bcast(
-                    f"🚦 <b>ГОНКА СТАРТОВАЛА!</b>\n\n<b>{self.gp}</b>\n\n{fmt_weather(w)}"
-                )
+        elif (flag == "GREEN" or "GREEN LIGHT" in up or "RACE START" in up)                 and not self.start_sent and self.sess_type == "race":
+            self.start_sent = True
+            w = await get_weather(self.city)
+            await self._bcast(f"🚦 <b>ГОНКА СТАРТОВАЛА!</b>\n\n<b>{self.gp}</b>\n\n{fmt_weather(w)}")
 
-            elif ("GREEN LIGHT" in up or "RACE START" in up or "GO" == up.strip()) and not self.start_sent and self.sess_type == "race":
-                self.start_sent = True
-                w = await get_weather(self.city)
-                await self._bcast(
-                    f"🚦 <b>ГОНКА СТАРТОВАЛА!</b>\n\n<b>{self.gp}</b>\n\n{fmt_weather(w)}"
-                )
+        elif "SAFETY CAR" in up and "VIRTUAL" not in up and "MEDICAL" not in up:
+            if "DEPLOYED" in up or flag == "SC":
+                await self._bcast(f"🚗 <b>Safety Car!</b>\n{text}")
+            elif "WITHDRAWN" in up or "IN THIS LAP" in up:
+                await self._bcast("🚗 <b>Safety Car возвращается в боксы</b>")
 
-            # ── SAFETY CAR ────────────────────────────────────────────────────
-            elif "SAFETY CAR" in up and "VIRTUAL" not in up and "MEDICAL" not in up:
-                if "DEPLOYED" in up or flag == "SC":
-                    await self._bcast(f"🚗 <b>Safety Car!</b>\n\n<b>{self.gp}</b>\n{text}")
-                elif "WITHDRAWN" in up or "IN THIS LAP" in up:
-                    await self._bcast("🚗 <b>Safety Car возвращается в боксы</b>")
+        elif flag == "VSC" or "VIRTUAL SAFETY CAR" in up:
+            if "DEPLOYED" in up or flag == "VSC":
+                await self._bcast("🔶 <b>Virtual Safety Car (VSC)!</b>")
+            elif "ENDING" in up or "RESUMED" in up:
+                await self._bcast("🔶 <b>VSC заканчивается — рестарт!</b>")
 
-            # ── VIRTUAL SC ───────────────────────────────────────────────────
-            elif flag == "VSC" or "VIRTUAL SAFETY CAR" in up:
-                if "DEPLOYED" in up or flag == "VSC":
-                    await self._bcast("🔶 <b>Virtual Safety Car (VSC)!</b>")
-                elif "ENDING" in up or "RESUMED" in up:
-                    await self._bcast("🔶 <b>VSC заканчивается — готовьтесь к рестарту!</b>")
+        elif flag == "YELLOW":
+            scope = m.get("scope", "")
+            await self._bcast(f"🟡 <b>Жёлтый флаг</b>{' · Сектор ' + scope if scope else ''}\n{text}")
 
-            # ── ЖЁЛТЫЙ ────────────────────────────────────────────────────────
-            elif flag == "YELLOW":
-                sector = m.get("scope", "")
-                await self._bcast(f"🟡 <b>Жёлтый флаг!</b>{' Сектор: ' + sector if sector else ''}\n{text}")
+        elif flag == "RED":
+            await self._bcast(f"🔴 <b>КРАСНЫЙ ФЛАГ!</b>\n\n{self.gp}\n{text}")
 
-            # ── КРАСНЫЙ ───────────────────────────────────────────────────────
-            elif flag == "RED":
-                await self._bcast(f"🔴 <b>КРАСНЫЙ ФЛАГ! Сессия остановлена!</b>\n\n<b>{self.gp}</b>\n{text}")
+        elif "PENALTY" in up or "SANCTION" in up or "DRIVE THROUGH" in up or "STOP AND GO" in up:
+            await self._bcast(f"⚖️ <b>Штраф</b>\n{text}")
 
-            # ── ШТРАФ ─────────────────────────────────────────────────────────
-            elif cat == "OTHER" and ("PENALTY" in up or "SANCTION" in up or "TIME PENALTY" in up):
-                await self._bcast(f"⚖️ <b>Штраф / расследование</b>\n{text}")
-
-            elif "DRIVE THROUGH" in up or "STOP AND GO" in up or "GRID PENALTY" in up:
-                await self._bcast(f"⚖️ <b>Штраф!</b>\n{text}")
-
-            # ── ФИНИШ ─────────────────────────────────────────────────────────
-            elif flag == "CHEQUERED" or "CHEQUERED" in up or "CHECKERED" in up:
-                label = "Гонка" if self.sess_type == "race" else "Сессия"
-                await self._bcast(f"🏁 <b>{label} завершена!</b>\n\n<b>{self.gp}</b>")
-                await asyncio.sleep(120)
-                self.stop()
-                return
+        elif (flag == "CHEQUERED" or "CHEQUERED" in up or "CHECKERED" in up)                 and not self.finish_sent:
+            self.finish_sent = True
+            label = "Гонка" if self.sess_type == "race" else "Сессия"
+            await self._bcast(f"🏁 <b>{label} завершена!</b>\n\n<b>{self.gp}</b>")
+            if self.sess_type == "race":
+                # Запускаем авто-публикацию результатов
+                asyncio.ensure_future(self._post_race_results())
+            await asyncio.sleep(180)
+            self.stop()
 
     # ── Пит-стопы ────────────────────────────────────────────────────────────
     async def _pitstop(self):
         pits = await f1_pit(self.key)
+        new_pits = []
         for p in pits:
             dur = p.get("pit_duration")
             if not dur:
                 continue
             pid = f"{p.get('driver_number')}_{p.get('lap_number')}_{dur}"
-            if pid in self.seen_pit:
-                continue
-            self.seen_pit.add(pid)
+            if pid not in self.seen_pit:
+                self.seen_pit.add(pid)
+                new_pits.append(p)
+        # Отправляем батчем (не блокируем цикл)
+        for p in new_pits:
             dn = p.get("driver_number")
+            name = self._name(dn); flag = self._flag(dn); team = self._team(dn)
             await self._bcast(
-                f"🔧 <b>Пит-стоп!</b>\n\n"
-                f"👤 <b>{self._name(dn)}</b>\n"
-                f"🏭 {self._team(dn)}\n"
-                f"📌 Круг {p.get('lap_number','?')}\n"
-                f"⏱ {float(dur):.1f} с в боксах"
+                f"🔧 <b>Пит-стоп!</b>\n"
+                f"{flag} <b>{name}</b> ({team})\n"
+                f"📌 Круг {p.get('lap_number','?')}  ·  "
+                f"⏱ {float(dur):.1f} с"
             )
 
     # ── Быстрый круг ─────────────────────────────────────────────────────────
     async def _fl(self):
-        # Запрашиваем только последние круги, не всю историю
-        laps = await oget(f"/laps?session_key={self.key}&lap_number>1")
-        valid = [l for l in laps if l.get("lap_duration") and 60 < l["lap_duration"] < 180]
-        if not valid:
+        laps = await f1_laps(self.key)
+        if not laps:
             return
-        fastest = min(valid, key=lambda l: l["lap_duration"])
+        fastest = min(laps, key=lambda l: l["lap_duration"])
         dur = fastest["lap_duration"]
         if self.best_lap is not None and dur >= self.best_lap:
             return
         self.best_lap = dur
         dn   = fastest["driver_number"]
-        mins = int(dur // 60)
-        secs = dur % 60
+        mins = int(dur // 60); secs = dur % 60
+        name = self._name(dn); flag = self._flag(dn); team = self._team(dn)
         await self._bcast(
-            f"⚡ <b>Новый быстрый круг!</b>\n\n"
-            f"👤 <b>{self._name(dn)}</b> ({self._team(dn)})\n"
-            f"⏱ <b>{mins}:{secs:06.3f}</b>\n"
-            f"📌 Круг {fastest.get('lap_number','?')}"
+            f"⚡ <b>Новый быстрый круг!</b>\n"
+            f"{flag} <b>{name}</b> ({team})\n"
+            f"⏱ <b>{mins}:{secs:06.3f}</b>  ·  Круг {fastest.get('lap_number','?')}"
         )
 
-    # ── Позиции — следим за P1/P2/P3 финишем ────────────────────────────────
+    # ── Финиш P1/P2/P3 ───────────────────────────────────────────────────────
     async def _positions(self):
         if len(self.podium_sent) >= 3:
-            return   # уже отправили топ-3
-        pos_data = await oget(f"/position?session_key={self.key}")
+            return
+        pos_data = await f1_positions(self.key)
         if not pos_data:
             return
-        # Группируем по гонщику — берём самую последнюю запись
         latest: dict = {}
         for p in pos_data:
-            dn = p.get("driver_number")
-            latest[dn] = p
-        # Ищем финишировавших на P1/P2/P3 (позиция не меняется + круг > 50)
+            latest[p.get("driver_number")] = p
         for dn, p in latest.items():
             position = p.get("position")
-            if position in (1, 2, 3):
-                key = f"P{position}"
-                if key not in self.podium_sent:
-                    # Отправляем только если круг достаточно поздний (≥ 50)
-                    lap = p.get("lap_number", 0) or 0
-                    if lap >= 50:
-                        medals = {1:"🥇",2:"🥈",3:"🥉"}
-                        self.podium_sent.add(key)
-                        await self._bcast(
-                            f"{medals[position]} <b>P{position} — {self._name(dn)}!</b>\n"
-                            f"🏭 {self._team(dn)}\n"
-                            f"📌 Круг {lap}"
-                        )
+            if position in (1, 2, 3) and f"P{position}" not in self.podium_sent:
+                lap = p.get("lap_number", 0) or 0
+                if lap >= 45:
+                    medals = {1:"🥇", 2:"🥈", 3:"🥉"}
+                    self.podium_sent.add(f"P{position}")
+                    name = self._name(dn); flag = self._flag(dn); team = self._team(dn)
+                    await self._bcast(
+                        f"{medals[position]} <b>P{position} — {name}!</b>\n"
+                        f"{flag} ({team})  ·  Круг {lap}"
+                    )
+
+    # ── Авто-результаты после финиша ─────────────────────────────────────────
+    async def _post_race_results(self):
+        """
+        Сразу после гонки: итоговые позиции из OpenF1.
+        Через 10–40 мин (когда Jolpica обновится): официальные результаты.
+        """
+        await asyncio.sleep(90)   # ждём финальные позиции OpenF1
+
+        # Шаг 1: быстрые результаты из OpenF1 positions
+        pos_data = await f1_positions(self.key)
+        if pos_data:
+            latest: dict = {}
+            for p in pos_data:
+                dn = p.get("driver_number")
+                if dn not in latest or p.get("lap_number",0) > latest[dn].get("lap_number",0):
+                    latest[dn] = p
+            sorted_pos = sorted(latest.values(), key=lambda x: x.get("position", 99))
+            medals = {1:"🥇",2:"🥈",3:"🥉"}
+            lines  = [f"🏁 <b>Итоги гонки — {self.gp}</b>\n", "<b>Топ-10:</b>"]
+            for p in sorted_pos[:10]:
+                dn   = p.get("driver_number")
+                pos  = p.get("position", "?")
+                name = self._name(dn); flag = self._flag(dn); team = self._team(dn)
+                medal = medals.get(pos, f"{pos}.")
+                lines.append(f"  {medal} {flag} {name} ({team})")
+            lines.append("\n<i>Официальные результаты появятся позже в разделе «Итоги»</i>")
+            await self._bcast("\n".join(lines))
+
+        # Шаг 2: ждём Jolpica (проверяем каждые 10 мин, до 1 часа)
+        for attempt in range(6):
+            await asyncio.sleep(600)
+            rname, results = await last_race()
+            if results:
+                stds = await driver_standings()
+                pts  = {s["Driver"]["driverId"]: s["points"] for s in stds}
+                lines = [f"📊 <b>Официальные результаты — {rname}</b>\n"]
+                for r in results[:10]:
+                    d    = r["Driver"]
+                    last = d["familyName"]
+                    flag = driver_emoji(last)
+                    pos  = int(r["position"])
+                    medal = medals.get(pos, f"{pos}.")
+                    total = pts.get(d["driverId"], "—")
+                    lines.append(
+                        f"  {medal} {flag} {d['givenName'][0]}. {last}"
+                        f" ({r['Constructor']['name']}) +{r.get('points','0')} → {total} очк."
+                    )
+                await self._bcast("\n".join(lines))
+                log.info("Официальные результаты отправлены после %d мин", (attempt+1)*10)
+                return
+        log.warning("Jolpica так и не вернул результаты через час после гонки")
 
 
 _monitor: Optional[LiveMonitor] = None
 
+async def find_openf1_session(gp_name: str, sess_type: str) -> Optional[dict]:
+    """
+    Ищет session_key в OpenF1 по названию гонки и типу сессии.
+    Пробует latest, затем ищет по времени ±2 часа.
+    """
+    # Попытка 1: latest
+    for attempt in range(5):
+        sess = await f1_latest_sess()
+        if sess:
+            sname = (sess.get("session_name") or "").lower()
+            # Проверяем что это нужная сессия
+            type_ok = (
+                (sess_type == "race"     and ("race" in sname or "гонка" in sname)) or
+                (sess_type == "quali"    and "qualif" in sname) or
+                (sess_type == "practice" and ("practice" in sname or "fp" in sname)) or
+                True  # если не можем определить — берём latest
+            )
+            if type_ok:
+                log.info("OpenF1 сессия найдена (latest): sk=%s %s", sess["session_key"], sname)
+                return sess
+        log.info("start_live: ожидаем OpenF1 (попытка %d/5)...", attempt+1)
+        await asyncio.sleep(30)
+
+    # Попытка 2: поиск по текущему году и ближайшей сессии
+    now = datetime.now(tz=pytz.utc)
+    year = now.year
+    sessions = await oget(f"/sessions?year={year}")
+    if sessions:
+        # Найдём сессию, которая началась в последние 3 часа
+        for s in reversed(sessions):
+            try:
+                start_str = s.get("date_start", "")
+                if not start_str:
+                    continue
+                # Парсим ISO дату
+                from datetime import datetime as _dt
+                if start_str.endswith("Z"):
+                    start_str = start_str[:-1] + "+00:00"
+                s_start = _dt.fromisoformat(start_str).replace(tzinfo=pytz.utc)
+                delta   = (now - s_start).total_seconds()
+                if 0 <= delta <= 7200:   # началась в последние 2 часа
+                    log.info("OpenF1 сессия найдена по времени: sk=%s", s["session_key"])
+                    return s
+            except Exception as e:
+                continue
+
+    log.warning("start_live: сессия не найдена для %s", gp_name)
+    return None
+
 async def start_live(gp: str, city: str, sess_type: str = "race"):
     global _monitor
-    sess = await f1_latest_sess()
-    if not sess:
-        log.warning("start_live: нет OpenF1 сессии для %s", gp)
-        return
     if _monitor and _monitor.running:
         _monitor.stop()
-    _monitor = LiveMonitor(sess["session_key"], gp, city, sess_type)
+    sess = await find_openf1_session(gp, sess_type)
+    if not sess:
+        log.warning("start_live: не смогли найти OpenF1 сессию для %s", gp)
+        return
+    # Формируем mv_path для Multiviewer: "{round}/{session_abbr}"
+    year  = datetime.now(tz=pytz.utc).year
+    rnd   = sess.get("meeting_key", 0)
+    stype_abbr = {"race": "R", "quali": "Q", "practice": "P1", "sprint": "S"}.get(sess_type, "R")
+    mv_path = f"{rnd}/{stype_abbr}"
+    _monitor = LiveMonitor(sess["session_key"], gp, city, sess_type, mv_path=mv_path, year=year)
     asyncio.create_task(_monitor.run())
 
 # ── SCHEDULER ─────────────────────────────────────────────────────────────────
@@ -913,17 +1187,18 @@ async def send_reminder(ev,mins):
            f"🕐 <b>{msk_dt.strftime('%H:%M')} МСК</b>  ·  {loc.strftime('%H:%M')} местного",""]
     wdata=await get_weather(city, target_dt=ev["start_utc"])
     lines.append(fmt_weather_block(wdata, target_dt=ev["start_utc"]))
-    if "гонка" in ev["summary"].lower() and mins>0:
+    if "гонка" in ev["summary"].lower() and mins >= 0:
         _,qr=await last_quali()
         if qr:
             lines.append("\n🏁 <b>Стартовая решётка:</b>")
-            for q in qr[:5]: d=q["Driver"]; lines.append(f"  {q['position']}. {d['givenName'][0]}. {d['familyName']}")
-            lines.append("  …")
+            for q in qr:
+                d    = q["Driver"]
+                last = d["familyName"]
+                flag = driver_emoji(last)
+                team = q["Constructor"]["name"]
+                lines.append(f"  <b>P{q['position']}</b>  {flag} {d['givenName'][0]}. {last}  ({team})")
     text="\n".join(lines)
-    if not _app: return
-    for cid in active_subs():
-        try: await _app.bot.send_message(cid,text,parse_mode="HTML")
-        except Exception as e: log.warning("Reminder→%s: %s",cid,e)
+    await broadcast(text)
 
 def schedule_all():
     wks=build_weekends(); now=datetime.now(tz=pytz.utc); count=0
@@ -978,12 +1253,24 @@ def main_kb(cid, priv):
     ]
     return InlineKeyboardMarkup(rows)
 
-async def cur_weekend_kb():
-    """Кнопки текущего уикенда с индикатором наличия результатов."""
-    _, qr = await last_quali()
-    _, rr = await last_race()
-    q_dot = "🟢" if qr else "⚫️"
-    r_dot = "🟢" if rr else "⚫️"
+async def cur_weekend_kb(w: dict = None):
+    """Кнопки текущего уикенда с индикатором наличия результатов.
+    w — уикенд для которого показываем кнопки; галочки проверяются по нему."""
+    qname, qr = await last_quali()
+    rname, rr = await last_race()
+
+    # Проверяем что результаты относятся к этому уикенду (по названию ГП)
+    gp = (w.get("gp_name") or "").lower() if w else ""
+    def _matches(name: str) -> bool:
+        if not gp or not name: return False
+        # Jolpica возвращает "Australian Grand Prix" — сравниваем ключевое слово
+        nl = name.lower()
+        # Берём первое слово из gp_name и ищем его в rname
+        keyword = gp.split()[0]
+        return keyword in nl
+
+    q_dot = "🟢" if (qr and _matches(qname)) else "⚫️"
+    r_dot = "🟢" if (rr and _matches(rname)) else "⚫️"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"🔥 Квалификация — результаты {q_dot}", callback_data="res:quali")],
         [InlineKeyboardButton(f"🏁 Гонка — результаты {r_dot}",        callback_data="res:race")],
@@ -1147,7 +1434,7 @@ async def on_cb(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text("😔 Нет данных.", reply_markup=back_kb()); return
         await q.edit_message_text("⏳ Загружаю...", parse_mode="HTML")
         text = await fmt_cur_weekend_with_results(w)
-        await q.edit_message_text(text[:4090], parse_mode="HTML", reply_markup=await cur_weekend_kb()); return
+        await q.edit_message_text(text[:4090], parse_mode="HTML", reply_markup=await cur_weekend_kb(w)); return
 
     # ── Следующий уикенд ──────────────────────────────────────────────────────
     if data == "cal:next":
@@ -1216,14 +1503,16 @@ async def on_cb(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ── Результаты (квали/гонка) — из текущего уикенда ───────────────────────
     if data == "res:quali":
         await q.edit_message_text("⏳ Загружаю...", parse_mode="HTML")
+        wks = build_weekends(); cw = cur_weekend(wks) or nxt_weekend(wks)
         await q.edit_message_text(
-            (await fmt_quali())[:4090], parse_mode="HTML", reply_markup=await cur_weekend_kb()
+            (await fmt_quali())[:4090], parse_mode="HTML", reply_markup=await cur_weekend_kb(cw)
         ); return
 
     if data == "res:race":
         await q.edit_message_text("⏳ Загружаю...", parse_mode="HTML")
+        wks = build_weekends(); cw = cur_weekend(wks) or nxt_weekend(wks)
         await q.edit_message_text(
-            (await fmt_race())[:4090], parse_mode="HTML", reply_markup=await cur_weekend_kb()
+            (await fmt_race())[:4090], parse_mode="HTML", reply_markup=await cur_weekend_kb(cw)
         ); return
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
