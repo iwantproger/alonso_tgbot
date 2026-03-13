@@ -824,6 +824,23 @@ async def fmt_stroll_stats() -> str:
                 else:        hist.append(f"<i>P{pos}</i>")
             lines.append(f"  📋 По гонкам: {' · '.join(hist)}")
 
+        # ── Хуев в жопе (сезон) ──────────────────────────────────────────────
+        total_ahead_season = 0
+        total_participants_season = 0
+        for res in rounds:
+            if isinstance(res, Exception) or not res: continue
+            _, rr = res
+            if not rr: continue
+            sr2 = next((r for r in rr if r["Driver"]["familyName"]=="Stroll"), None)
+            if not sr2: continue
+            stroll_pos2   = int(sr2.get("position", len(rr)) or len(rr))
+            n_participants = len(rr)
+            ahead          = stroll_pos2 - 1   # гонщики впереди Стролла
+            total_ahead_season       += ahead
+            total_participants_season += n_participants
+        lines.append("")
+        lines.append(f"  🍆 <b>Хуев в жопе (сезон): {total_ahead_season} из {total_participants_season}</b>")
+
     lines.append("")
 
     # ── ПОСЛЕДНЯЯ ГОНКА ──────────────────────────────────────────────────────
@@ -871,6 +888,11 @@ async def fmt_stroll_stats() -> str:
                 icon = "⚡" if str(fl_r)=="1" else "🕐"
                 extra = " — <b>БЫСТРЕЙШИЙ КРУГ!</b>" if str(fl_r)=="1" else f" (ранг {fl_r})"
                 lines.append(f"  {icon} Быстрый круг: <code>{fl_t}</code>{extra}")
+
+        # Хуев в жопе (последняя гонка)
+        n_race      = len(race_results)
+        ahead_race  = pos - 1
+        lines.append(f"  🍆 <b>Хуев в жопе: {ahead_race} из {n_race}</b>")
 
         # Контекст выступления
         lines.append("")
@@ -977,7 +999,7 @@ async def fmt_standings():
         return "❌ Данные чемпионата недоступны — результаты гонок ещё не опубликованы"
     lines = ["🏆 <b>Чемпионат гонщиков 2026</b>\n"]
     medals = {1:"🥇", 2:"🥈", 3:"🥉"}
-    for i, s in enumerate(stds[:20], 1):
+    for i, s in enumerate(stds[:22], 1):
         try:
             d    = s["Driver"]
             team = (s.get("Constructors") or [{}])[0].get("name","—")
@@ -1081,17 +1103,18 @@ async def fmt_race():
         drv = fmt_driver_jolpica(d, r["Constructor"]["name"])
         lines.append(f"  {medals[pos]} {drv} +{r.get('points','0')} очк.")
 
-    # Топ-10
-    lines.append("\n<b>Итоговая таблица (топ-10):</b>")
-    for r in results[:10]:
-        d     = r["Driver"]
-        pos   = int(r["position"])
-        total = pm.get(d["driverId"],"—")
-        # Время/отставание
-        t_raw = r.get("Time",{}).get("time","") if pos > 1 else "победитель"
+    # Все 22 гонщика
+    lines.append("\n<b>Итоговая таблица:</b>")
+    finished = [r for r in results if r.get("status","") in ("Finished","+1 Lap","+2 Laps","+3 Laps","+4 Laps","+5 Laps")]
+    dnf_list = [r for r in results if r not in finished]
+    for r in finished + dnf_list:
+        d      = r["Driver"]
+        pos    = int(r.get("position",99) or 99)
+        total  = pm.get(d["driverId"],"—")
+        t_raw  = r.get("Time",{}).get("time","") if pos > 1 else "победитель"
         status = r.get("status","Finished")
-        if status not in ("Finished","+1 Lap","+2 Laps","+3 Laps") and pos > 1:
-            gap = f"Сход ({status})"
+        if status not in ("Finished","+1 Lap","+2 Laps","+3 Laps","+4 Laps","+5 Laps") and pos > 1:
+            gap = f"❌ Сход ({status})"
         elif pos == 1:
             gap = t_raw or "победитель"
         else:
@@ -1228,15 +1251,17 @@ async def fmt_past_weekend(w: dict, rnd: int) -> str:
             drv = fmt_driver_jolpica(d, r["Constructor"]["name"])
             lines.append(f"  {medals[pos]} {drv} +{r.get('points','0')} очк.")
         lines.append("")
-        lines.append("<b>Топ-10:</b>")
-        for r in results[:10]:
-            d     = r["Driver"]
-            total = pts_map.get(d["driverId"], "—")
-            pos   = int(r["position"])
-            t_raw = r.get("Time",{}).get("time","") if pos > 1 else "победитель"
+        lines.append("<b>Итоговая таблица:</b>")
+        finished_p = [r for r in results if r.get("status","") in ("Finished","+1 Lap","+2 Laps","+3 Laps","+4 Laps","+5 Laps")]
+        dnf_p      = [r for r in results if r not in finished_p]
+        for r in finished_p + dnf_p:
+            d      = r["Driver"]
+            total  = pts_map.get(d["driverId"], "—")
+            pos    = int(r.get("position",99) or 99)
+            t_raw  = r.get("Time",{}).get("time","") if pos > 1 else "победитель"
             status = r.get("status","Finished")
-            if status not in ("Finished","+1 Lap","+2 Laps","+3 Laps") and pos > 1:
-                gap = f"Сход ({status})"
+            if status not in ("Finished","+1 Lap","+2 Laps","+3 Laps","+4 Laps","+5 Laps") and pos > 1:
+                gap = f"❌ Сход ({status})"
             elif pos == 1:
                 gap = t_raw or "победитель"
             else:
@@ -1249,11 +1274,13 @@ async def fmt_past_weekend(w: dict, rnd: int) -> str:
         lines.append("📭 Результаты гонки ещё не опубликованы")
 
     if stds:
-        lines.append("\n🏆 <b>Чемпионат после этапа:</b>")
-        for s in stds[:5]:
-            d   = s["Driver"]
-            drv = fmt_driver_jolpica(d)
-            lines.append(f"  {s['position']}. {drv} — {s['points']} очк.")
+        lines.append("\n🏆 <b>Чемпионат после этапа (топ-10):</b>")
+        for s in stds[:10]:
+            d    = s["Driver"]
+            team = (s.get("Constructors") or [{}])[0].get("name","—")
+            drv  = fmt_driver_jolpica(d, team)
+            pos_raw = s.get("position") or s.get("positionText","?")
+            lines.append(f"  {pos_raw}. {drv} — {s['points']} очк.")
 
     return "\n".join(lines)
 
