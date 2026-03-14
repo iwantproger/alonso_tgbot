@@ -1024,9 +1024,22 @@ async def fmt_standings():
             continue
     return "\n".join(lines)
 
-async def fmt_quali():
-    rname,_,results=await last_quali()
-    if not results: return "❌ Результаты квалификации недоступны — сезон ещё не начался"
+async def fmt_quali(w: dict = None):
+    rname, qdate, results = await last_quali()
+    if not results:
+        return "📭 Результаты квалификации ещё не опубликованы — сессия не прошла или данные обновляются"
+    # Проверяем что результаты относятся к текущему уикенду
+    if w and qdate:
+        try:
+            result_dt = datetime.strptime(qdate, "%Y-%m-%d").replace(tzinfo=pytz.utc)
+            w_start   = w["start_utc"] - timedelta(days=1)
+            w_end     = w["end_utc"]   + timedelta(days=3)
+            if not (w_start <= result_dt <= w_end):
+                return (f"⏳ Квалификация {w.get('gp_name','')} ещё не прошла\n"
+                        f"или результаты ещё не опубликованы Jolpica.\n\n"
+                        f"Последние доступные данные: <b>{rname}</b>")
+        except Exception:
+            pass
     lines=[f"🔥 <b>Квалификация — {rname}</b>\n"]
     q3=[r for r in results if r.get("Q3")]
     q2=[r for r in results if r.get("Q2") and not r.get("Q3")]
@@ -1084,11 +1097,23 @@ async def fmt_quali():
             lines.append(f"  ⚠️ Выбыл в {'Q1' if not reached_q2 else 'Q2'} — трудный старт гонки")
     return "\n".join(lines)
 
-async def fmt_race():
-    rname,_,results=await last_race()
-    if not results: return "❌ Результаты гонки недоступны — сезон ещё не начался"
+async def fmt_race(w: dict = None):
+    rname, rdate, results = await last_race()
+    if not results:
+        return "📭 Результаты гонки ещё не опубликованы — гонка не прошла или данные обновляются"
+    # Проверяем что результаты относятся к текущему уикенду
+    if w and rdate:
+        try:
+            result_dt = datetime.strptime(rdate, "%Y-%m-%d").replace(tzinfo=pytz.utc)
+            w_start   = w["start_utc"] - timedelta(days=1)
+            w_end     = w["end_utc"]   + timedelta(days=3)
+            if not (w_start <= result_dt <= w_end):
+                return (f"⏳ Гонка {w.get('gp_name','')} ещё не прошла\n"
+                        f"или результаты ещё не опубликованы.\n\n"
+                        f"Последние доступные данные: <b>{rname}</b>")
+        except Exception:
+            pass
     stds=await driver_standings(); pm={s["Driver"]["driverId"]:s["points"] for s in stds}
-    # Квалификационная позиция для Леклера
     _, _, qresults = await last_quali()
     qpos = {r["Driver"]["driverId"]: int(r["position"]) for r in qresults} if qresults else {}
 
@@ -1401,7 +1426,7 @@ class LiveMonitor:
 
     async def _poll(self):
         """Параллельный опрос всех источников."""
-        if self.sess_type == "race":
+        if self.sess_type in ("race", "sprint"):
             await asyncio.gather(
                 self._rc(),
                 self._pitstop(),
@@ -1409,7 +1434,7 @@ class LiveMonitor:
                 self._positions(),
                 return_exceptions=True
             )
-        elif self.sess_type == "quali":
+        elif self.sess_type in ("quali", "sprint_quali"):
             await asyncio.gather(
                 self._rc(),
                 self._fl(),
@@ -1439,10 +1464,11 @@ class LiveMonitor:
             label = "Прогревочный круг" if self.sess_type == "race" else "Сессия начинается"
             await self._bcast(f"🏎️ <b>{label}!</b>\n\n<b>{self.gp}</b>")
 
-        elif (flag == "GREEN" or "GREEN LIGHT" in up or "RACE START" in up)                 and not self.start_sent and self.sess_type == "race":
+        elif (flag == "GREEN" or "GREEN LIGHT" in up or "RACE START" in up)                 and not self.start_sent and self.sess_type in ("race", "sprint"):
             self.start_sent = True
+            label = "ГОНКА" if self.sess_type == "race" else "СПРИНТ"
             w = await get_weather(self.city)
-            await self._bcast(f"🚦 <b>ГОНКА СТАРТОВАЛА!</b>\n\n<b>{self.gp}</b>\n\n{fmt_weather(w)}")
+            await self._bcast(f"🚦 <b>{label} СТАРТОВАЛ!</b>\n\n<b>{self.gp}</b>\n\n{fmt_weather(w)}")
 
         elif "SAFETY CAR" in up and "VIRTUAL" not in up and "MEDICAL" not in up:
             if "DEPLOYED" in up or flag == "SC":
@@ -1468,10 +1494,11 @@ class LiveMonitor:
 
         elif (flag == "CHEQUERED" or "CHEQUERED" in up or "CHECKERED" in up)                 and not self.finish_sent:
             self.finish_sent = True
-            label = "Гонка" if self.sess_type == "race" else "Сессия"
+            labels = {"race":"Гонка","sprint":"Спринт","quali":"Квалификация",
+                      "sprint_quali":"Квалификация к спринту","practice":"Практика"}
+            label = labels.get(self.sess_type, "Сессия")
             await self._bcast(f"🏁 <b>{label} завершена!</b>\n\n<b>{self.gp}</b>")
-            if self.sess_type == "race":
-                # Запускаем авто-публикацию результатов
+            if self.sess_type in ("race", "sprint"):
                 asyncio.ensure_future(self._post_race_results())
             await asyncio.sleep(180)
             self.stop()
@@ -1597,53 +1624,66 @@ _monitor: Optional[LiveMonitor] = None
 # Активные фоновые задачи загрузки: message_id → Task
 _loading_tasks: dict[int, asyncio.Task] = {}
 
+# Маппинг типов сессий на ключевые слова OpenF1
+_SESS_KEYWORDS = {
+    "race":           ("race",),
+    "sprint":         ("sprint shootout", "sprint race", "sprint"),
+    "sprint_quali":   ("sprint qualifying", "sprint shootout"),
+    "quali":          ("qualifying",),
+    "practice":       ("practice",),
+}
+
+def _sess_type_matches(sname: str, sess_type: str) -> bool:
+    sname = sname.lower()
+    keywords = _SESS_KEYWORDS.get(sess_type, ())
+    return any(k in sname for k in keywords)
+
+def _parse_openf1_dt(s: str) -> Optional[datetime]:
+    if not s: return None
+    try:
+        s = s.rstrip("Z")
+        if "+" not in s: s += "+00:00"
+        return datetime.fromisoformat(s).astimezone(pytz.utc)
+    except Exception:
+        return None
+
 async def find_openf1_session(gp_name: str, sess_type: str) -> Optional[dict]:
     """
-    Ищет session_key в OpenF1 по названию гонки и типу сессии.
-    Пробует latest, затем ищет по времени ±2 часа.
+    Ищет нужную сессию в OpenF1:
+    1. latest — если совпадает по типу
+    2. Все сессии года → ищем начавшуюся в последние 3 ч с нужным типом
+    3. Повторяем 5 раз с паузой 30 с
     """
-    # Попытка 1: latest
+    now = datetime.now(tz=pytz.utc)
+
     for attempt in range(5):
+        # Попытка А: latest
         sess = await f1_latest_sess()
         if sess:
             sname = (sess.get("session_name") or "").lower()
-            # Проверяем что это нужная сессия
-            type_ok = (
-                (sess_type == "race"     and ("race" in sname or "гонка" in sname)) or
-                (sess_type == "quali"    and "qualif" in sname) or
-                (sess_type == "practice" and ("practice" in sname or "fp" in sname)) or
-                True  # если не можем определить — берём latest
-            )
-            if type_ok:
-                log.info("OpenF1 сессия найдена (latest): sk=%s %s", sess["session_key"], sname)
+            if _sess_type_matches(sname, sess_type):
+                log.info("OpenF1 latest: sk=%s '%s'", sess["session_key"], sname)
                 return sess
-        log.info("start_live: ожидаем OpenF1 (попытка %d/5)...", attempt+1)
-        await asyncio.sleep(30)
 
-    # Попытка 2: поиск по текущему году и ближайшей сессии
-    now = datetime.now(tz=pytz.utc)
-    year = now.year
-    sessions = await oget(f"/sessions?year={year}")
-    if sessions:
-        # Найдём сессию, которая началась в последние 3 часа
-        for s in reversed(sessions):
-            try:
-                start_str = s.get("date_start", "")
-                if not start_str:
-                    continue
-                # Парсим ISO дату
-                from datetime import datetime as _dt
-                if start_str.endswith("Z"):
-                    start_str = start_str[:-1] + "+00:00"
-                s_start = _dt.fromisoformat(start_str).replace(tzinfo=pytz.utc)
-                delta   = (now - s_start).total_seconds()
-                if 0 <= delta <= 7200:   # началась в последние 2 часа
-                    log.info("OpenF1 сессия найдена по времени: sk=%s", s["session_key"])
-                    return s
-            except Exception as e:
+        # Попытка Б: все сессии года, ищем по времени + типу
+        year = now.year
+        sessions = await oget(f"/sessions?year={year}")
+        for s in sorted(sessions, key=lambda x: x.get("date_start",""), reverse=True):
+            s_start = _parse_openf1_dt(s.get("date_start",""))
+            if not s_start: continue
+            delta = (now - s_start).total_seconds()
+            if not (-300 <= delta <= 10800):  # от -5 мин до +3 ч
                 continue
+            sname = (s.get("session_name") or "").lower()
+            if _sess_type_matches(sname, sess_type):
+                log.info("OpenF1 по времени: sk=%s '%s' delta=%.0fs", s["session_key"], sname, delta)
+                return s
 
-    log.warning("start_live: сессия не найдена для %s", gp_name)
+        log.info("find_openf1_session: попытка %d/5 для %s %s", attempt+1, gp_name, sess_type)
+        if attempt < 4:
+            await asyncio.sleep(30)
+
+    log.warning("find_openf1_session: не нашли для %s %s", gp_name, sess_type)
     return None
 
 async def start_live(gp: str, city: str, sess_type: str = "race"):
@@ -1652,13 +1692,13 @@ async def start_live(gp: str, city: str, sess_type: str = "race"):
         _monitor.stop()
     sess = await find_openf1_session(gp, sess_type)
     if not sess:
-        log.warning("start_live: не смогли найти OpenF1 сессию для %s", gp)
+        log.warning("start_live: сессия не найдена для %s %s", gp, sess_type)
         return
-    # Формируем mv_path для Multiviewer: "{round}/{session_abbr}"
-    year  = datetime.now(tz=pytz.utc).year
-    rnd   = sess.get("meeting_key", 0)
-    stype_abbr = {"race": "R", "quali": "Q", "practice": "P1", "sprint": "S"}.get(sess_type, "R")
-    mv_path = f"{rnd}/{stype_abbr}"
+    year = datetime.now(tz=pytz.utc).year
+    rnd  = sess.get("meeting_key", 0)
+    abbr_map = {"race":"R","sprint":"S","sprint_quali":"SQ","quali":"Q","practice":"P"}
+    mv_path  = f"{rnd}/{abbr_map.get(sess_type,'R')}"
+    log.info("start_live: sk=%s gp=%s type=%s mv=%s", sess["session_key"], gp, sess_type, mv_path)
     _monitor = LiveMonitor(sess["session_key"], gp, city, sess_type, mv_path=mv_path, year=year)
     asyncio.create_task(_monitor.run())
 
@@ -1698,17 +1738,19 @@ def schedule_all():
                                       id=f"r{m}_{s['summary']}_{start.isoformat()}",replace_existing=True)
                     count+=1
             # Запускаем live-монитор для гонки, квалификации и практики
-            is_quali   = "квалификация" in s["summary"].lower() and "спринту" not in s["summary"].lower()
-            is_sprint  = "спринт" in s["summary"].lower()
-            is_practice= "свободных" in s["summary"].lower()
-            if (is_race or is_quali or is_sprint or is_practice) and start>now:
+            summ_lower = s["summary"].lower()
+            is_race         = "гонка" in summ_lower and "спринт" not in summ_lower
+            is_sprint       = "спринт" in summ_lower and "квалификация" not in summ_lower and "к спринту" not in summ_lower
+            is_sprint_quali = "к спринту" in summ_lower or ("спринт" in summ_lower and "квалификация" in summ_lower)
+            is_quali        = "квалификация" in summ_lower and not is_sprint_quali
+            is_practice     = "свободных" in summ_lower
+            if (is_race or is_quali or is_sprint or is_sprint_quali or is_practice) and start>now:
                 t_live = start + timedelta(minutes=2)
-                if is_race or is_sprint:
-                    stype = "race"
-                elif is_quali:
-                    stype = "quali"
-                else:
-                    stype = "practice"
+                if is_race:             stype = "race"
+                elif is_sprint:         stype = "sprint"
+                elif is_sprint_quali:   stype = "sprint_quali"
+                elif is_quali:          stype = "quali"
+                else:                   stype = "practice"
                 scheduler.add_job(start_live,"date",run_date=t_live,
                                   args=[w["gp_name"],w["city"],stype],
                                   id=f"live_{s['summary']}_{start.isoformat()}",replace_existing=True)
@@ -2050,12 +2092,12 @@ async def on_cb(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ── Результаты (квали/гонка) — из текущего уикенда ───────────────────────
     if data == "res:quali":
         wks = build_weekends(); cw = cur_weekend(wks) or nxt_weekend(wks)
-        await run_with_cancel(q, "Загружаю результаты квалификации...", fmt_quali(),
+        await run_with_cancel(q, "Загружаю результаты квалификации...", fmt_quali(cw),
                               reply_kb_fn=lambda: cur_weekend_kb(cw)); return
 
     if data == "res:race":
         wks = build_weekends(); cw = cur_weekend(wks) or nxt_weekend(wks)
-        await run_with_cancel(q, "Загружаю результаты гонки...", fmt_race(),
+        await run_with_cancel(q, "Загружаю результаты гонки...", fmt_race(cw),
                               reply_kb_fn=lambda: cur_weekend_kb(cw)); return
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
