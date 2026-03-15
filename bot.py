@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import asyncio, json, logging, os, re
+import asyncio, base64, json, logging, os, re, urllib.parse, zlib
 from collections import OrderedDict
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -1348,6 +1348,335 @@ async def fmt_past_quali(w: dict, rnd: int) -> str:
             lines.append(f"  {r['position']:>2}. {drv}  <code>{r.get('Q1','—')}</code>")
     return "\n".join(lines)
 
+# ── F1 LIVE TIMING WEBSOCKET ─────────────────────────────────────────────────
+# Официальный источник данных F1 (тот же что Multiviewer и FastF1)
+# Задержка ~1-2 сек vs 7 сек polling у OpenF1
+# Документация протокола: github.com/tdjsnelling/monaco
+
+F1_WS_BASE   = "https://livetiming.formula1.com/signalr"
+F1_WS_TOPICS = [
+    "RaceControlMessages",   # флаги, SC, VSC, штрафы, старт, финиш
+    "TimingData",            # времена кругов по гонщикам
+    "LapCount",              # текущий круг
+    "PitLaneTimeCollection", # пит-стопы с временем
+    "DriverList",            # список гонщиков сессии
+    "SessionInfo",           # тип/статус сессии
+    "SessionData",           # события сессии (старт, SCperiod, и т.д.)
+]
+
+class F1TimingWS:
+    """
+    Подключается к F1 Live Timing через SignalR WebSocket,
+    парсит потоки данных и вызывает колбэки LiveMonitor.
+    """
+    def __init__(self, monitor: "LiveMonitor"):
+        self.monitor    = monitor
+        self.running    = False
+        self._ws        = None
+        self._msg_id    = 0
+        # Накопленные состояния (некоторые приходят как delta-обновления)
+        self._drivers:  dict = {}    # racingNumber → {name, team, ...}
+        self._laps:     dict = {}    # racingNumber → best lap seconds
+        self._pit_times:dict = {}    # key → sent flag
+
+    # ── Подключение ──────────────────────────────────────────────────────────
+    async def connect_and_run(self):
+        """Основной цикл: подключаемся, читаем, переподключаемся при обрыве."""
+        self.running = True
+        backoff = 2
+        while self.running:
+            try:
+                await self._session()
+                backoff = 2   # сбрасываем после успешного коннекта
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log.warning("F1TimingWS: обрыв (%s), переподключение через %ds", e, backoff)
+                if self.running:
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 60)
+
+    def stop(self):
+        self.running = False
+
+    async def _session(self):
+        """Одна сессия: negotiate → connect → subscribe → read loop."""
+        # 1. Negotiate — получаем connection token
+        neg_url = (
+            f"{F1_WS_BASE}/negotiate"
+            f"?connectionData={urllib.parse.quote(json.dumps([{'name':'Streaming'}]))}"
+            f"&clientProtocol=1.5"
+        )
+        async with http.get(neg_url, timeout=aiohttp.ClientTimeout(total=10),
+                            headers={"User-Agent": "BestHTTP", "Accept-Encoding": "gzip, identity"}) as r:
+            neg = await r.json(content_type=None)
+        token = neg["ConnectionToken"]
+        log.info("F1TimingWS: negotiate ok, token=%.20s...", token)
+
+        # 2. WebSocket URL
+        ws_url = (
+            "wss://livetiming.formula1.com/signalr/connect"
+            f"?transport=webSockets"
+            f"&clientProtocol=1.5"
+            f"&connectionToken={urllib.parse.quote(token)}"
+            f"&connectionData={urllib.parse.quote(json.dumps([{'name':'Streaming'}]))}"
+        )
+
+        # 3. Подключаемся
+        async with http.ws_connect(
+            ws_url,
+            timeout=aiohttp.ClientTimeout(total=None, sock_connect=10),
+            heartbeat=30.0,
+            headers={"User-Agent": "BestHTTP"},
+        ) as ws:
+            self._ws = ws
+            log.info("F1TimingWS: connected ✅")
+
+            # 4. Подписываемся на топики
+            self._msg_id += 1
+            await ws.send_str(json.dumps({
+                "H": "Streaming",
+                "M": "Subscribe",
+                "A": [F1_WS_TOPICS],
+                "I": self._msg_id,
+            }))
+
+            # 5. Читаем сообщения
+            async for msg in ws:
+                if not self.running:
+                    break
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    await self._on_message(msg.data)
+                elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                    log.warning("F1TimingWS: ws closed/error")
+                    break
+
+    # ── Парсинг сообщений ─────────────────────────────────────────────────────
+    async def _on_message(self, raw: str):
+        try:
+            outer = json.loads(raw)
+        except Exception:
+            return
+
+        # SignalR heartbeat — просто C без M
+        if "M" not in outer:
+            return
+
+        for item in outer.get("M", []):
+            if not isinstance(item, dict):
+                continue
+            if item.get("M") != "feed":
+                continue
+            args = item.get("A", [])
+            if len(args) < 2:
+                continue
+            topic   = args[0]
+            payload = args[1]
+            # timestamp = args[2] if len(args) > 2 else ""
+            await self._dispatch(topic, payload)
+
+    def _decompress(self, data: str) -> dict:
+        """Распаковываем zlib+base64 данные (топики с суффиксом .z)."""
+        try:
+            raw = base64.b64decode(data)
+            return json.loads(zlib.decompress(raw, -zlib.MAX_WBITS).decode("utf-8"))
+        except Exception as e:
+            log.debug("F1TimingWS decompress: %s", e)
+            return {}
+
+    async def _dispatch(self, topic: str, payload):
+        """Роутим данные по топику → нужный обработчик."""
+        try:
+            if topic == "RaceControlMessages":
+                await self._on_rc(payload)
+            elif topic == "TimingData":
+                await self._on_timing(payload)
+            elif topic == "PitLaneTimeCollection":
+                await self._on_pit(payload)
+            elif topic == "DriverList":
+                self._on_drivers(payload)
+            elif topic == "LapCount":
+                self._on_lapcount(payload)
+            elif topic == "SessionData":
+                await self._on_session_data(payload)
+        except Exception as e:
+            log.debug("F1TimingWS dispatch %s: %s", topic, e)
+
+    # ── RaceControl ───────────────────────────────────────────────────────────
+    async def _on_rc(self, payload):
+        """payload = {"Messages": {"0": {...}, "1": {...}}} или список."""
+        messages = []
+        if isinstance(payload, dict):
+            msgs = payload.get("Messages", payload)
+            if isinstance(msgs, dict):
+                messages = list(msgs.values())
+            elif isinstance(msgs, list):
+                messages = msgs
+        elif isinstance(payload, list):
+            messages = payload
+
+        for m in messages:
+            if not isinstance(m, dict):
+                continue
+            # Нормализуем в формат LiveMonitor
+            normalized = {
+                "date":    m.get("Utc", m.get("date", "")),
+                "message": m.get("Message", m.get("message", "")),
+                "flag":    m.get("Flag", m.get("flag", "")),
+                "category":m.get("Category", m.get("category", "")),
+                "scope":   m.get("Scope", m.get("scope", "")),
+            }
+            uid = f"{normalized['date']}{normalized['message']}"
+            if uid and uid not in self.monitor.seen_rc:
+                self.monitor.seen_rc.add(uid)
+                log.info("F1TimingWS RC: %s | %s", normalized["flag"], normalized["message"][:60])
+                await self.monitor._handle_rc(normalized)
+
+    # ── Времена кругов ────────────────────────────────────────────────────────
+    async def _on_timing(self, payload):
+        """
+        TimingData содержит времена по гонщикам.
+        payload = {"Lines": {"1": {"LastLapTime": {"Value": "1:32.456", "PersonalFastest": true}, ...}}}
+        """
+        if not isinstance(payload, dict):
+            return
+        lines = payload.get("Lines", {})
+        for racing_num, data in lines.items():
+            if not isinstance(data, dict):
+                continue
+            lap_data = data.get("LastLapTime", {})
+            if not isinstance(lap_data, dict):
+                continue
+            val_str = lap_data.get("Value", "")
+            if not val_str or val_str in ("", "0.000"):
+                continue
+            # Парсим "1:32.456" → секунды
+            secs = self._parse_laptime(val_str)
+            if not secs or secs < 60 or secs > 300:
+                continue
+            # Ищем driver_number по racing_num (они совпадают в большинстве случаев)
+            dn = int(racing_num) if racing_num.isdigit() else None
+            if dn is None:
+                continue
+            if self.monitor.best_lap is None or secs < self.monitor.best_lap:
+                self.monitor.best_lap = secs
+                mins = int(secs // 60); rem = secs % 60
+                name = self.monitor._name(dn)
+                flag = self.monitor._flag(dn)
+                team = self.monitor._team(dn)
+                await self.monitor._bcast(
+                    f"⚡ <b>Новый быстрый круг!</b>\n"
+                    f"{flag} <b>{name}</b> ({team})\n"
+                    f"⏱ <b>{mins}:{rem:06.3f}</b>"
+                )
+
+    def _parse_laptime(self, s: str) -> Optional[float]:
+        """'1:32.456' → 92.456, '32.456' → 32.456"""
+        try:
+            if ":" in s:
+                parts = s.split(":")
+                return int(parts[0]) * 60 + float(parts[1])
+            return float(s)
+        except Exception:
+            return None
+
+    # ── Пит-стопы ─────────────────────────────────────────────────────────────
+    async def _on_pit(self, payload):
+        """
+        PitLaneTimeCollection = {"PitTimes": {"1": {"Duration": "2.4", "Lap": 5}}}
+        """
+        if not isinstance(payload, dict):
+            return
+        pit_times = payload.get("PitTimes", payload)
+        if not isinstance(pit_times, dict):
+            return
+        for racing_num, pdata in pit_times.items():
+            if not isinstance(pdata, dict):
+                continue
+            dur_str = str(pdata.get("Duration", "") or "")
+            lap     = pdata.get("Lap", "?")
+            if not dur_str or dur_str == "0":
+                continue
+            pid = f"{racing_num}_{lap}_{dur_str}"
+            if pid in self.monitor.seen_pit:
+                continue
+            self.monitor.seen_pit.add(pid)
+            try:
+                dur = float(dur_str)
+            except ValueError:
+                continue
+            dn   = int(racing_num) if racing_num.isdigit() else None
+            name = self.monitor._name(dn) if dn else f"#{racing_num}"
+            flag = self.monitor._flag(dn) if dn else "🏁"
+            team = self.monitor._team(dn) if dn else ""
+            log.info("F1TimingWS PIT: #%s lap=%s dur=%.1fs", racing_num, lap, dur)
+            await self.monitor._bcast(
+                f"🔧 <b>Пит-стоп!</b>\n{flag} <b>{name}</b> ({team})\n📌 Круг {lap}  ·  ⏱ {dur:.1f} с"
+            )
+
+    # ── DriverList ─────────────────────────────────────────────────────────────
+    def _on_drivers(self, payload):
+        """Обновляем кэш гонщиков если WS дал данные."""
+        if not isinstance(payload, dict):
+            return
+        for racing_num, info in payload.items():
+            if not isinstance(info, dict):
+                continue
+            dn = int(racing_num) if racing_num.isdigit() else None
+            if dn is None:
+                continue
+            # Дополняем/обновляем drivers в мониторе
+            existing = self.monitor.drivers.get(dn, {})
+            existing.update({
+                "driver_number": dn,
+                "full_name":     info.get("FullName", existing.get("full_name", "")),
+                "broadcast_name":info.get("BroadcastName", existing.get("broadcast_name", "")),
+                "team_name":     info.get("TeamName", existing.get("team_name", "")),
+            })
+            self.monitor.drivers[dn] = existing
+
+    # ── LapCount ──────────────────────────────────────────────────────────────
+    def _on_lapcount(self, payload):
+        if isinstance(payload, dict):
+            current = payload.get("CurrentLap")
+            total   = payload.get("TotalLaps")
+            if current:
+                log.debug("F1TimingWS LapCount: %s/%s", current, total)
+
+    # ── SessionData (старт, ред флаг и т.д.) ─────────────────────────────────
+    async def _on_session_data(self, payload):
+        """
+        SessionData.StatusSeries = [{"Utc": "...", "TrackStatus": "1"}]
+        TrackStatus: 1=зелёный 2=жёлтый 4=SC 5=VSC 6=красный
+        """
+        if not isinstance(payload, dict):
+            return
+        series = payload.get("StatusSeries", [])
+        if isinstance(series, dict):
+            series = list(series.values())
+        for item in series:
+            if not isinstance(item, dict):
+                continue
+            status = str(item.get("TrackStatus", ""))
+            utc    = item.get("Utc", "")
+            uid    = f"status_{utc}_{status}"
+            if uid in self.monitor.seen_rc:
+                continue
+            self.monitor.seen_rc.add(uid)
+            status_map = {
+                "1": None,          # зелёный — уже обрабатываем через RC
+                "2": ("🟡", "<b>Жёлтый флаг на трассе</b>"),
+                "4": ("🚗", "<b>Safety Car!</b>"),
+                "5": ("🔶", "<b>Virtual Safety Car!</b>"),
+                "6": ("🔴", "<b>КРАСНЫЙ ФЛАГ!</b>"),
+            }
+            msg_data = status_map.get(status)
+            if msg_data:
+                icon, text = msg_data
+                log.info("F1TimingWS SessionData status=%s", status)
+                await self.monitor._bcast(f"{icon} {text}\n<b>{self.monitor.gp}</b>")
+
+
 # ── LIVE MONITOR ──────────────────────────────────────────────────────────────
 class LiveMonitor:
     POLL_INTERVAL = 7   # сек между опросами
@@ -1376,23 +1705,19 @@ class LiveMonitor:
         self.running = True
         log.info("🔴 LiveMonitor start sk=%s  %s  type=%s", self.key, self.gp, self.sess_type)
 
-        # Параллельно грузим гонщиков + историю RC + питы + круги
-        (self.drivers,
-         history_rc,
-         hist_pits,
-         hist_laps) = await asyncio.gather(
+        # Параллельно грузим историю — глотаем без отправки
+        (self.drivers, history_rc, hist_pits, hist_laps) = await asyncio.gather(
             f1_drivers(self.key),
             f1_rc(self.key, self.mv_path, self.year),
             f1_pit(self.key),
             f1_laps(self.key),
             return_exceptions=True
         )
-        if isinstance(self.drivers, Exception): self.drivers = {}
-        if isinstance(history_rc,   Exception): history_rc   = []
-        if isinstance(hist_pits,    Exception): hist_pits    = []
-        if isinstance(hist_laps,    Exception): hist_laps    = []
+        if isinstance(self.drivers,  Exception): self.drivers  = {}
+        if isinstance(history_rc,    Exception): history_rc    = []
+        if isinstance(hist_pits,     Exception): hist_pits     = []
+        if isinstance(hist_laps,     Exception): hist_laps     = []
 
-        # Глотаем историю — не отправляем
         for m in history_rc:
             self.seen_rc.add(f"{m.get('date','')}{m.get('message','')}")
         for p in hist_pits:
@@ -1402,18 +1727,48 @@ class LiveMonitor:
             self.best_lap = min(l["lap_duration"] for l in valid_laps)
 
         log.info("История: %d RC, %d pit, best=%.3fs, %d гонщиков",
-                 len(self.seen_rc), len(self.seen_pit),
-                 self.best_lap or 0, len(self.drivers))
+                 len(self.seen_rc), len(self.seen_pit), self.best_lap or 0, len(self.drivers))
 
+        # Запускаем два источника параллельно:
+        # 1. F1 Live Timing WebSocket  — основной (~1-2с задержка)
+        # 2. OpenF1 polling            — fallback + позиции/подиум
+        self._ws_client = F1TimingWS(self)
+        await asyncio.gather(
+            self._run_ws(),
+            self._run_poll_loop(),
+            return_exceptions=True
+        )
+
+    async def _run_ws(self):
+        """WebSocket источник — перезапускается при обрыве."""
+        try:
+            await self._ws_client.connect_and_run()
+        except Exception as e:
+            log.warning("F1TimingWS завершился: %s", e)
+
+    async def _run_poll_loop(self):
+        """OpenF1 polling — только позиции/подиум, RC/pit/FL дублируем для надёжности."""
         while self.running:
             try:
-                await self._poll()
+                # Позиции OpenF1 нет в WS — всегда polling
+                if self.sess_type in ("race", "sprint"):
+                    await self._positions()
+                # RC+pit+FL — дублируем из OpenF1 для случая если WS отвалился
+                # Дедупликация через seen_rc/seen_pit предотвращает двойные уведомления
+                await asyncio.gather(
+                    self._rc(),
+                    self._pitstop() if self.sess_type in ("race","sprint") else asyncio.sleep(0),
+                    self._fl(),
+                    return_exceptions=True
+                )
             except Exception as e:
-                log.error("LiveMonitor poll: %s", e)
+                log.debug("poll loop: %s", e)
             await asyncio.sleep(self.POLL_INTERVAL)
 
     def stop(self):
         self.running = False
+        if hasattr(self, "_ws_client"):
+            self._ws_client.stop()
         log.info("LiveMonitor stopped — %s", self.gp)
 
     def _name(self, n) -> str:
@@ -1505,7 +1860,10 @@ class LiveMonitor:
             await self._bcast(f"🏁 <b>{label} завершена!</b>\n\n<b>{self.gp}</b>")
             if self.sess_type in ("race", "sprint"):
                 asyncio.ensure_future(self._post_race_results())
-            await asyncio.sleep(180)
+            # Ждём 3 мин чтобы доловить последние события после финиша
+            for _ in range(36):
+                if not self.running: break
+                await asyncio.sleep(5)
             self.stop()
 
     # ── Пит-стопы ────────────────────────────────────────────────────────────
