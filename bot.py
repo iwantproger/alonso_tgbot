@@ -1031,20 +1031,27 @@ async def fmt_standings():
 
 async def fmt_quali(w: dict = None):
     rname, qdate, results = await last_quali()
-    if not results:
-        return "📭 Результаты квалификации ещё не опубликованы — сессия не прошла или данные обновляются"
-    # Проверяем что результаты относятся к текущему уикенду
-    if w and qdate:
+
+    _wrong_weekend = False
+    if w and qdate and results:
         try:
             result_dt = datetime.strptime(qdate, "%Y-%m-%d").replace(tzinfo=pytz.utc)
             w_start   = w["start_utc"] - timedelta(days=1)
             w_end     = w["end_utc"]   + timedelta(days=3)
             if not (w_start <= result_dt <= w_end):
-                return (f"⏳ Квалификация {w.get('gp_name','')} ещё не прошла\n"
-                        f"или результаты ещё не опубликованы Jolpica.\n\n"
-                        f"Последние доступные данные: <b>{rname}</b>")
+                _wrong_weekend = True
         except Exception:
             pass
+
+    if not results or _wrong_weekend:
+        gp_name = w.get("gp_name","") if w else ""
+        if _wrong_weekend:
+            return (f"⏳ <b>Результаты квалификации {gp_name} ещё не опубликованы</b>\n\n"
+                    f"Jolpica обновляет через 1–2 часа после сессии.\n"
+                    f"Последние данные: <b>{rname}</b>")
+        return (f"⏳ <b>Данные квалификации обновляются</b>\n\n"
+                f"Обычно появляются через 1–2 часа после сессии.\n"
+                f"Нажми <b>Обновить</b> через несколько минут.")
     lines=[f"🔥 <b>Квалификация — {rname}</b>\n"]
     q3=[r for r in results if r.get("Q3")]
     q2=[r for r in results if r.get("Q2") and not r.get("Q3")]
@@ -1102,22 +1109,87 @@ async def fmt_quali(w: dict = None):
             lines.append(f"  ⚠️ Выбыл в {'Q1' if not reached_q2 else 'Q2'} — трудный старт гонки")
     return "\n".join(lines)
 
+async def _fmt_race_from_openf1(w: dict = None) -> str:
+    """
+    Предварительные результаты из OpenF1 — доступны сразу после финиша,
+    до публикации официальных данных в Jolpica.
+    """
+    try:
+        # Берём последнюю гонку из OpenF1
+        sess = await f1_latest_sess()
+        if not sess:
+            return ""
+        sk = sess.get("session_key")
+        sname = (sess.get("session_name") or "").lower()
+        # Проверяем что это гонка
+        if "race" not in sname and "sprint" not in sname:
+            return ""
+        year  = sess.get("year", datetime.now(tz=pytz.utc).year)
+        gp    = sess.get("meeting_name", "")
+        drivers = await f1_drivers(sk)
+        pos_data = await f1_positions(sk)
+        laps_data = await f1_laps(sk)
+        if not pos_data:
+            return ""
+        # Последние позиции каждого гонщика
+        latest: dict = {}
+        for p in pos_data:
+            dn = p.get("driver_number")
+            lap = p.get("lap_number", 0) or 0
+            if dn not in latest or lap > (latest[dn].get("lap_number",0) or 0):
+                latest[dn] = p
+        sorted_pos = sorted(latest.values(), key=lambda x: x.get("position", 99))
+        if not sorted_pos:
+            return ""
+        medals = {1:"🥇",2:"🥈",3:"🥉"}
+        lines = [f"🏁 <b>{gp} — предварительные результаты</b>",
+                 "<i>⚠️ Данные OpenF1 · Официальные результаты появятся позже</i>\n"]
+        for p in sorted_pos:
+            dn  = p.get("driver_number")
+            pos = p.get("position", 99)
+            d   = drivers.get(dn, {})
+            full = d.get("full_name") or d.get("broadcast_name") or f"#{dn}"
+            last = full.split()[-1] if full else ""
+            flag = driver_emoji(last)
+            team = d.get("team_name","")
+            medal = medals.get(pos, f"{pos:>2}.")
+            lines.append(f"  {medal} {flag} <b>{full}</b> ({team})")
+        lines.append("\n<i>Нажми Обновить через несколько минут для официальных данных</i>")
+        return "\n".join(lines)
+    except Exception as e:
+        log.debug("_fmt_race_from_openf1: %s", e)
+        return ""
+
 async def fmt_race(w: dict = None):
     rname, rdate, results = await last_race()
-    if not results:
-        return "📭 Результаты гонки ещё не опубликованы — гонка не прошла или данные обновляются"
-    # Проверяем что результаты относятся к текущему уикенду
-    if w and rdate:
+
+    # Проверяем принадлежность к текущему уикенду
+    _wrong_weekend = False
+    if w and rdate and results:
         try:
             result_dt = datetime.strptime(rdate, "%Y-%m-%d").replace(tzinfo=pytz.utc)
             w_start   = w["start_utc"] - timedelta(days=1)
             w_end     = w["end_utc"]   + timedelta(days=3)
             if not (w_start <= result_dt <= w_end):
-                return (f"⏳ Гонка {w.get('gp_name','')} ещё не прошла\n"
-                        f"или результаты ещё не опубликованы.\n\n"
-                        f"Последние доступные данные: <b>{rname}</b>")
+                _wrong_weekend = True
         except Exception:
             pass
+
+    # Если данных нет или они от другого уикенда — пробуем OpenF1 как запасной вариант
+    if not results or _wrong_weekend:
+        gp_name = w.get("gp_name","") if w else ""
+        openf1_text = await _fmt_race_from_openf1(w)
+        if openf1_text:
+            return openf1_text
+        if _wrong_weekend:
+            return (f"⏳ <b>Результаты {gp_name} ещё не опубликованы</b>\n\n"
+                    f"Jolpica обновляет данные через 1–3 часа после финиша.\n"
+                    f"Нажми <b>Обновить</b> позже.\n\n"
+                    f"Последние данные Jolpica: <b>{rname}</b>")
+        return (f"⏳ <b>Данные гонки обновляются</b>\n\n"
+                f"Обычно результаты появляются через 1–3 часа после финиша.\n"
+                f"Нажми <b>Обновить</b> через несколько минут.")
+
     stds=await driver_standings(); pm={s["Driver"]["driverId"]:s["points"] for s in stds}
     _, _, qresults = await last_quali()
     qpos = {r["Driver"]["driverId"]: int(r["position"]) for r in qresults} if qresults else {}
@@ -2218,6 +2290,7 @@ async def cur_weekend_kb(w: dict = None):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"🔥 Квалификация — результаты {q_dot}", callback_data="res:quali")],
         [InlineKeyboardButton(f"🏁 Гонка — результаты {r_dot}",        callback_data="res:race")],
+        [InlineKeyboardButton("🔄 Обновить",                           callback_data="cal:current")],
         _home(),
     ])
 
