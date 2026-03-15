@@ -50,7 +50,9 @@ async def broadcast(text: str, parse_mode: str = "HTML"):
     migrated = []   # (old_id, new_id)
     for cid in active_subs():
         try:
-            await _app.bot.send_message(cid, text, parse_mode=parse_mode)
+            await asyncio.wait_for(
+                    _app.bot.send_message(cid, text, parse_mode=parse_mode),
+                    timeout=10.0)
         except Exception as e:
             err = str(e)
             if "ChatMigrated" in err or "chat_id_invalid" in err.lower():
@@ -61,7 +63,9 @@ async def broadcast(text: str, parse_mode: str = "HTML"):
                 if new_id:
                     migrated.append((cid, new_id))
                     try:
-                        await _app.bot.send_message(new_id, text, parse_mode=parse_mode)
+                        await asyncio.wait_for(
+                                _app.bot.send_message(new_id, text, parse_mode=parse_mode),
+                                timeout=10.0)
                         log.info("ChatMigrated: %s → %s, обновляем", cid, new_id)
                     except Exception as e2:
                         log.warning("После миграции %s: %s", new_id, e2)
@@ -211,31 +215,32 @@ def _wx(en):
 
 async def get_weather(city, target_dt: datetime = None):
     """
-    Получает текущую погоду + прогноз на target_dt (если передан).
-    Пробует до 3 раз с паузой — wttr.in бывает нестабилен.
-    Резервный источник: open-meteo.com (работает всегда, без ключа).
+    Погода с жёстким общим таймаутом 6 сек.
+    wttr.in → open-meteo → пустой dict (не блокируем event loop).
     """
     city_q = _city_en(city)
+    try:
+        return await asyncio.wait_for(_get_weather_inner(city_q, target_dt), timeout=6.0)
+    except asyncio.TimeoutError:
+        log.warning("get_weather: таймаут 6с для '%s'", city_q)
+        return {"current": {}, "forecast": None}
+    except Exception as e:
+        log.warning("get_weather: %s", e)
+        return {"current": {}, "forecast": None}
 
-    # ── Попытка 1-3: wttr.in ─────────────────────────────────────────────────
+async def _get_weather_inner(city_q: str, target_dt: datetime = None):
+    # ── Попытка 1: wttr.in (один раз, таймаут 4 сек) ─────────────────────────
     data = None
-    for attempt in range(3):
-        try:
-            url = f"https://wttr.in/{city_q}?format=j1"
-            async with http.get(url, timeout=aiohttp.ClientTimeout(total=12),
-                                headers={"User-Agent": "F1Bot/1.0"}) as r:
-                text = await r.text()
-                # wttr.in иногда отдаёт HTML вместо JSON при перегрузке
-                if text.strip().startswith("{"):
-                    import json as _json
-                    data = _json.loads(text)
-                    break
-                else:
-                    log.warning("wttr.in вернул не-JSON (попытка %d): %s...", attempt+1, text[:80])
-        except Exception as e:
-            log.warning("wttr.in попытка %d для '%s': %s", attempt+1, city_q, e)
-        if attempt < 2:
-            await asyncio.sleep(2)
+    try:
+        url = f"https://wttr.in/{city_q}?format=j1"
+        async with http.get(url, timeout=aiohttp.ClientTimeout(total=4),
+                            headers={"User-Agent": "curl/7.68.0"}) as r:
+            text = await r.text()
+            if text.strip().startswith("{"):
+                import json as _json
+                data = _json.loads(text)
+    except Exception as e:
+        log.debug("wttr.in для '%s': %s", city_q, e)
 
     if data:
         try:
@@ -281,8 +286,8 @@ async def get_weather(city, target_dt: datetime = None):
         except Exception as e:
             log.warning("Парсинг wttr.in для '%s': %s", city_q, e)
 
-    # ── Резерв: Open-Meteo (геокодинг + погода, без ключа) ───────────────────
-    log.info("Переключаемся на open-meteo для '%s'", city_q)
+    # ── Резерв: Open-Meteo ───────────────────────────────────────────────────
+    log.debug("Переключаемся на open-meteo для '%s'", city_q)
     try:
         # Шаг 1: получаем координаты через open-meteo geocoding
         geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={city_q}&count=1&language=en"
@@ -1687,6 +1692,10 @@ async def find_openf1_session(gp_name: str, sess_type: str) -> Optional[dict]:
     return None
 
 async def start_live(gp: str, city: str, sess_type: str = "race"):
+    """Запускает поиск сессии и монитор в фоне — не блокирует event loop."""
+    asyncio.create_task(_start_live_bg(gp, city, sess_type))
+
+async def _start_live_bg(gp: str, city: str, sess_type: str):
     global _monitor
     if _monitor and _monitor.running:
         _monitor.stop()
@@ -1712,7 +1721,10 @@ async def send_reminder(ev,mins):
     lines=[head,"",f"{ev.get('flag','🏁')} <b>{ev['summary']}</b>",
            f"📍 {ev.get('country','')}, {city}",
            f"🕐 <b>{msk_dt.strftime('%H:%M')} МСК</b>  ·  {loc.strftime('%H:%M')} местного",""]
-    wdata=await get_weather(city, target_dt=ev["start_utc"])
+    try:
+        wdata = await asyncio.wait_for(get_weather(city, target_dt=ev["start_utc"]), timeout=7.0)
+    except Exception:
+        wdata = {"current": {}, "forecast": None}
     lines.append(fmt_weather_block(wdata, target_dt=ev["start_utc"]))
     if "гонка" in ev["summary"].lower() and mins >= 0:
         _,_,qr=await last_quali()
@@ -2113,7 +2125,15 @@ async def post_shutdown(app:Application):
     if scheduler.running: scheduler.shutdown(wait=False)
 
 def main():
-    app=(Application.builder().token(BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build())
+    app=(Application.builder()
+         .token(BOT_TOKEN)
+         .connect_timeout(20.0)
+         .read_timeout(30.0)
+         .write_timeout(20.0)
+         .pool_timeout(10.0)
+         .post_init(post_init)
+         .post_shutdown(post_shutdown)
+         .build())
     app.add_handler(CommandHandler("start",cmd_start))
     app.add_handler(CommandHandler("status",cmd_status))
     app.add_handler(CallbackQueryHandler(on_cb))
